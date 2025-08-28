@@ -255,15 +255,25 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
     conf_thres = engin_configs[0]["conf_thres"]
     iou_thres  = engin_configs[0]["iou_thres"]
 
-    # 모델 경로 결정
+    # 모델 경로
     if use_enf:
-        enf_path = ENF_DIR / param["task"] / f"{model_name}.enf"
+        # batch-size에 따라 ENF 파일명 결정
+        if batch_size and batch_size > 1:
+            enf_file = f"{model_name}_{batch_size}b.enf"
+        else:
+            enf_file = f"{model_name}.enf"
+
+        enf_path = ENF_DIR / param["task"] / enf_file
         if enf_path.is_file():
             model_path = str(enf_path)
         else:
             raise FileNotFoundError(f"ENF file not found: {enf_path}")
     else:
-        model_path = os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"])
+        model_path = param.get("onnx_i8_path")
+        if not model_path:
+            model_path = os.path.join(
+                QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"]
+            )
 
     # 전/후처리
     preprocessor = YoloPreProcessor(new_shape=input_shape[2:])
