@@ -142,8 +142,11 @@ def set_test_engin_configs(param, num_device):
             "model_type": param["model_name"],
             "input_shape": param["input_shape"][2:],
             "class_names": param["class_names"],
-            "conf_thres": CONF_THRES,
-            "iou_thres": IOU_THRES,
+            #"conf_thres": CONF_THRES,
+            #"iou_thres": IOU_THRES,
+            ## -- jgcha
+            "conf_thres": float(param.get("conf_thres", CONF_THRES)),
+            "iou_thres": float(param.get("iou_thres", IOU_THRES)),
             "use_tracking": False,
         }
         engin_configs.append(engin_config)

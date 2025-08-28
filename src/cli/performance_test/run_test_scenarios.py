@@ -15,17 +15,25 @@ from ...warboy import get_model_params_from_cfg
     required=True,
     help="The path to the model configuration file.",
 )
-def run_e2e_test(config_file: str):
+@click.option(
+    "--batch-size",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Override batch size for inference (default: 1).",
+)
+def run_e2e_test(config_file: str, batch_size: int):
     ANNOTATION_DIR = (
-        "datasets/coco/annotations"  # CHECK you may change this to your own path
+        "../datasets/coco/annotations"  # CHECK you may change this to your own path
     )
 
-    IMAGE_DIR = "datasets/coco/val2017"  # CHECK you may change this to your own path
+    IMAGE_DIR = "../datasets/coco/val2017"  # CHECK you may change this to your own path
 
     param = get_model_params_from_cfg(config_file)
 
     if param["task"] == "object_detection":
-        func = object_det.test_warboy_yolo_accuracy_det
+        #func = object_det.test_warboy_yolo_accuracy_det
+        func = object_det.test_warboy_yolo_performance_det
         annotation = f"{ANNOTATION_DIR}/instances_val2017.json"
         image_dir = IMAGE_DIR
 
@@ -44,7 +52,7 @@ def run_e2e_test(config_file: str):
             "Invalid task type. Choose from 'object_detection', 'pose_estimation', or 'instance_segmentation'."
         )
 
-    func(config_file, image_dir, annotation)
+    func(config_file, image_dir, annotation, batch_size=batch_size)
 
 
 @click.command(

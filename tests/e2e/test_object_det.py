@@ -20,6 +20,12 @@ from tests.utils import (
 )
 
 CONFIG_PATH = "./tests/test_config/object_detection"
+##-- jgcha
+ENF_DIR = Path("../models/enf")  # models/enf/object_detection/<model_name>.enf
+##-- True  -> ENF 파일을 직접 로드 (컴파일 없이 즉시 추론)
+##-- False -> 양자화 ONNX(quantized_onnx)를 로드 (최초 1회 컴파일 후 캐시 재사용)
+USE_ENF = True
+
 YAML_PATH = [
     os.path.join(CONFIG_PATH, model_name + ".yaml")
     for model_name in TEST_MODEL_LIST["object_detection"]
@@ -27,15 +33,34 @@ YAML_PATH = [
 
 PARAMS = [get_model_params_from_cfg(yaml) for yaml in YAML_PATH]
 
-PARAMETERS = [
-    (
-        param["model_name"],
-        os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"]),
+PARAMETERS = []
+for param in PARAMS:
+    task = param["task"]                    # 예: "object_detection"
+    model_name = param["model_name"]        # 예: "yolov9t"
+    if USE_ENF:
+        # ENF 경로 직접 사용
+        model_path = str(ENF_DIR / task / f"{model_name}.enf")
+    else:
+        # 양자화 ONNX 경로 사용 (최초 실행 시 컴파일 후 캐시 재사용)
+        model_path = os.path.join(QUANTIZED_ONNX_DIR, task, param["onnx_i8_path"])
+
+    PARAMETERS.append((
+        model_name,
+        model_path,
         param["input_shape"],
         param["anchors"],
-    )
-    for param in PARAMS
-]
+        task,
+    ))
+
+# PARAMETERS = [
+#     (
+#         param["model_name"],
+#         os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"]),
+#         param["input_shape"],
+#         param["anchors"],
+#     )
+#     for param in PARAMS
+# ]
 
 TARGET_ACCURACY = {
     "yolov5nu": 0.343,
@@ -133,6 +158,21 @@ async def warboy_inference(model, data_loader, preprocessor, postprocessor):
 def test_warboy_yolo_accuracy_det(
     model_name: str, model: str, input_shape: List[int], anchors
 ):
+
+    ##-- ENF 사용 모드일 때는 ENF 파일 존재 검사
+    if USE_ENF:
+        if not Path(model).is_file():
+            ##-- 안내: ENF 생성 방법 힌트 제공
+            qonnx = os.path.join(QUANTIZED_ONNX_DIR, task, f"{model_name}_i8.onnx")
+            enf_target = ENF_DIR / task / f"{model_name}.enf"
+            raise FileNotFoundError(
+                f"[ENF not found]\n"
+                f"  - Expected: {model}\n\n"
+                f"To create it once, run:\n"
+                f"  furiosa-compiler {qonnx} -o {enf_target}\n"
+                f"(Then rerun the test; it will load ENF without compilation.)"
+            )
+
     model_cfg = {"conf_thres": CONF_THRES, "iou_thres": IOU_THRES, "anchors": anchors}
 
     preprocessor = YoloPreProcessor(new_shape=input_shape[2:])
@@ -141,9 +181,9 @@ def test_warboy_yolo_accuracy_det(
     ).postprocess_func
 
     data_loader = MSCOCODataLoader(
-        Path("datasets/coco/val2017"),  # CHECK you may change this to your own path
+        Path("../datasets/coco/val2017"),  # CHECK you may change this to your own path
         Path(
-            "datasets/coco/annotations/instances_val2017.json"
+            "../datasets/coco/annotations/instances_val2017.json"
         ),  # CHECK you may change this to your own path
         preprocessor,
         input_shape,
