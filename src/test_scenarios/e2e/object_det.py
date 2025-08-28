@@ -8,6 +8,7 @@ from typing import List
 import asyncio
 import time
 from statistics import mean, median
+import numpy as np
 
 from pycocotools.cocoeval import COCOeval
 
@@ -163,74 +164,167 @@ def test_warboy_yolo_accuracy_det(cfg: str, image_dir: str, annotation_file: str
         )
 
 
-async def _inference_with_metrics(model, data_loader, preprocessor, postprocessor, worker_num=16, output_dir="outputs"):
+async def _inference_with_metrics(model, data_loader, preprocessor, postprocessor,
+                                  batch_size=1, worker_num=16, output_dir="outputs"):
+    """
+    - bs==1: inp를 4D(1,C,H,W)로 보장해 runner.run([inp_4d]) 후 heads 그대로 postprocess
+    - bs>1 : inp를 3D(C,H,W)로 모아 (N,C,H,W) 입력 → 각 head에서 i번째 슬라이스를
+             4D(1,C,H,W)로 다시 감싸서 per-image 후처리
+    """
     from furiosa.runtime import create_runner
-
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     saved_count = 0
 
     async def task(runner, data_loader, worker_id, worker_num):
         nonlocal saved_count
-        e2e_ms, inf_ms, pre_ms, post_ms = [], [], [], []
-        results = []
+        e2e_ms, inf_ms, pre_ms, post_ms, results = [], [], [], [], []
+        batch_buf = []  # (inp3d, ctx, img0shape, ann, img, img_path, t0, t1)
+
+        def visualize_and_collect(outputs, img, img_path, annotation):
+            nonlocal saved_count, results
+            bboxes = xyxy2xywh(outputs[:, :4])
+            bboxes[:, :2] -= bboxes[:, 2:] / 2
+            for output, bbox in zip(outputs, bboxes):
+                results.append({
+                    "image_id": annotation["id"],
+                    "category_id": YOLO_CATEGORY_TO_COCO_CATEGORY[int(output[5])],
+                    "bbox": [round(x, 3) for x in bbox],
+                    "score": round(float(output[4]), 5),
+                })
+            if saved_count < 10:
+                for det in outputs:
+                    x1, y1, x2, y2, conf, cls = det[:6]
+                    cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
+                    cv2.putText(img, f"{int(cls)} {conf:.2f}", (int(x1), max(int(y1)-5, 0)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                out_path = Path(output_dir) / f"{saved_count+1}.jpg"
+                cv2.imwrite(str(out_path), img)
+                saved_count += 1
 
         for idx, (img_path, annotation) in enumerate(data_loader):
             if idx % worker_num != worker_id:
                 continue
+
             img = cv2.imread(str(img_path))
             img0shape = img.shape[:2]
 
             # 전처리
             t0 = time.perf_counter()
-            inp, ctx = preprocessor(img)
+            inp, ctx = preprocessor(img)  # (C,H,W) 또는 (1,C,H,W)
             t1 = time.perf_counter()
 
-            # 추론
+            if batch_size == 1:
+                # ---- 단일 배치: 입력을 4D로 보장하고, heads 그대로 postprocess ----
+                if inp.ndim == 3:
+                    inp_4d = inp[np.newaxis, ...]     # (1,C,H,W)
+                elif inp.ndim == 4:
+                    inp_4d = inp
+                else:
+                    raise ValueError(f"Unexpected input ndim for bs=1: {inp.ndim}")
+
+                t2 = time.perf_counter()
+                preds = await runner.run([inp_4d])    # heads: list of (1,C,H,W)
+                t3 = time.perf_counter()
+
+                t4 = time.perf_counter()
+                outputs = postprocessor(preds, ctx, img0shape)[0]
+                t5 = time.perf_counter()
+
+                visualize_and_collect(outputs, img, img_path, annotation)
+
+                pre_ms.append((t1 - t0) * 1000)
+                inf_ms.append((t3 - t2) * 1000)
+                post_ms.append((t5 - t4) * 1000)
+                e2e_ms.append((t5 - t0) * 1000)
+
+            else:
+                # ---- 다중 배치: stack 전에 3D로 통일 → (N,C,H,W)로 run ----
+                if inp.ndim == 4:
+                    if inp.shape[0] != 1:
+                        raise ValueError(f"For bs>1, expected leading batch 1. got {inp.shape}")
+                    inp3d = inp[0]
+                elif inp.ndim == 3:
+                    inp3d = inp
+                else:
+                    raise ValueError(f"Unexpected input ndim for bs>1: {inp.ndim}")
+
+                batch_buf.append((inp3d, ctx, img0shape, annotation, img, img_path, t0, t1))
+
+                if len(batch_buf) == batch_size:
+                    batched_input = np.stack([b[0] for b in batch_buf], axis=0)  # (N,C,H,W)
+
+                    t2 = time.perf_counter()
+                    preds = await runner.run([batched_input])  # heads: list/tuple of (N,*,H,W)
+                    t3 = time.perf_counter()
+
+                    heads = list(preds) if isinstance(preds, (tuple, list)) else [preds]
+
+                    for i, (inp_i, ctx_i, img0shape_i, ann_i, img_i, img_path_i, t0_i, t1_i) in enumerate(batch_buf):
+                        per_img_heads = []
+                        for h in heads:
+                            if h.ndim == 4:
+                                per_img_heads.append(h[i][np.newaxis, ...])   # ★ 3D → 4D(1,C,H,W)
+                            elif h.ndim == 3:
+                                per_img_heads.append(h[np.newaxis, ...])      # ★ 3D → 4D
+                            else:
+                                raise ValueError(f"Unexpected head ndim (batch): {h.ndim}")
+
+                        t4 = time.perf_counter()
+                        outputs = postprocessor(per_img_heads, ctx_i, img0shape_i)[0]
+                        t5 = time.perf_counter()
+
+                        visualize_and_collect(outputs, img_i, img_path_i, ann_i)
+
+                        pre_ms.append((t1_i - t0_i) * 1000)
+                        inf_ms.append((t3 - t2) * 1000 / batch_size)
+                        post_ms.append((t5 - t4) * 1000)
+                        e2e_ms.append((t5 - t0_i) * 1000)
+
+                    batch_buf = []
+
+        # ---- 잔여 패딩 처리 ----
+        if batch_size > 1 and len(batch_buf) > 0:
+            actual = len(batch_buf)
+            pad_needed = batch_size - actual
+            batch_padded = batch_buf + [batch_buf[-1]] * pad_needed
+            batched_input = np.stack([b[0] for b in batch_padded], axis=0)
+
             t2 = time.perf_counter()
-            preds = await runner.run([inp])
+            preds = await runner.run([batched_input])
             t3 = time.perf_counter()
 
-            # 후처리
-            t4 = time.perf_counter()
-            outputs = postprocessor(preds, ctx, img0shape)[0]
-            t5 = time.perf_counter()
+            heads = list(preds) if isinstance(preds, (tuple, list)) else [preds]
 
-            # coco eval용 결과
-            bboxes = xyxy2xywh(outputs[:, :4])
-            bboxes[:, :2] -= bboxes[:, 2:] / 2
-            for output, bbox in zip(outputs, bboxes):
-                results.append(
-                    {
-                        "image_id": annotation["id"],
-                        "category_id": YOLO_CATEGORY_TO_COCO_CATEGORY[int(output[5])],
-                        "bbox": [round(x, 3) for x in bbox],
-                        "score": round(float(output[4]), 5),
-                    }
-                )
+            for i in range(actual):
+                inp_i, ctx_i, img0shape_i, ann_i, img_i, img_path_i, t0_i, t1_i = batch_buf[i]
+                per_img_heads = []
+                for h in heads:
+                    if h.ndim == 4:
+                        per_img_heads.append(h[i][np.newaxis, ...])  # ★ 4D 보장
+                    elif h.ndim == 3:
+                        per_img_heads.append(h[np.newaxis, ...])
+                    else:
+                        raise ValueError(f"Unexpected head ndim (remainder): {h.ndim}")
 
-            # 10장 출력 저장
-            if saved_count < 10:
-                for det in outputs:
-                    x1, y1, x2, y2, conf, cls = det[:6]
-                    cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                    cv2.putText(img, f"{int(cls)} {conf:.2f}", (int(x1), max(int(y1) - 5, 0)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                out_path = Path(output_dir) / f"{saved_count+1}.jpg"
-                cv2.imwrite(str(out_path), img)
-                saved_count += 1
+                t4 = time.perf_counter()
+                outputs = postprocessor(per_img_heads, ctx_i, img0shape_i)[0]
+                t5 = time.perf_counter()
 
-            # 시간 측정
-            pre_ms.append((t1 - t0) * 1000)
-            inf_ms.append((t3 - t2) * 1000)
-            post_ms.append((t5 - t4) * 1000)
-            e2e_ms.append((t5 - t0) * 1000)
+                visualize_and_collect(outputs, img_i, img_path_i, ann_i)
+
+                pre_ms.append((t1_i - t0_i) * 1000)
+                inf_ms.append((t3 - t2) * 1000 / batch_size)
+                post_ms.append((t5 - t4) * 1000)
+                e2e_ms.append((t5 - t0_i) * 1000)
 
         return e2e_ms, inf_ms, pre_ms, post_ms, results
 
-    async with create_runner(model, worker_num=worker_num, compiler_config={"use_program_loading": True}) as runner:
-        parts = await asyncio.gather(*[task(runner, data_loader, i, worker_num) for i in range(worker_num)])
+    async with create_runner(model, worker_num=worker_num,
+                             compiler_config={"use_program_loading": True}) as runner:
+        parts = await asyncio.gather(*[
+            task(runner, data_loader, i, worker_num) for i in range(worker_num)
+        ])
 
-    # 합치기
     e2e_all, inf_all, pre_all, post_all, results_all = [], [], [], [], []
     for e2e_ms, inf_ms, pre_ms, post_ms, results in parts:
         e2e_all.extend(e2e_ms)
@@ -240,6 +334,9 @@ async def _inference_with_metrics(model, data_loader, preprocessor, postprocesso
         results_all.extend(results)
 
     return {"e2e": e2e_all, "inf": inf_all, "pre": pre_all, "post": post_all}, results_all
+
+
+
 
 
 def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotation_file: str, use_enf=True, batch_size: int=1):
@@ -284,7 +381,9 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
 
     # 추론 실행
     start = time.time()
-    metrics, results = asyncio.run(_inference_with_metrics(model_path, data_loader, preprocessor, postprocessor))
+    metrics, results = asyncio.run(
+        _inference_with_metrics(model_path, data_loader, preprocessor, postprocessor, batch_size=batch_size)
+    )
     print(f"Inference Done in {time.time() - start:.2f} sec")
 
     # 성능 요약
