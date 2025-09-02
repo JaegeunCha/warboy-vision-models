@@ -1,8 +1,8 @@
 task: object_detection
-model_name: yolov9t
-weight: ../models/weight/object_detection/yolov9t.pt
-onnx_path: ../models/onnx/object_detection/yolov9t.onnx
-onnx_i8_path: ../models/quantized_onnx/object_detection/yolov9t_i8.onnx
+model_name: yolov9c
+weight: ../models/weight/object_detection/yolov9c.pt
+onnx_path: ../models/onnx/object_detection/yolov9c.onnx
+onnx_i8_path: ../models/quantized_onnx/object_detection/yolov9c_i8.onnx
 calibration_params:
   calibration_method: SQNR_ASYM
   calibration_data: ../datasets/coco/val2017
