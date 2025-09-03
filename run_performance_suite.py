@@ -228,6 +228,7 @@ def run_one(model: str, batch_size: int) -> Optional[dict]:
         "target": target,
         "status": status,
     }
+    
     # NEW: compute per-image wall throughput
     e2e_wall_imgps = get_e2e_wall_imgps(result)
     result.setdefault("computed", {})["e2e_wall_per_image"] = e2e_wall_imgps
@@ -250,11 +251,11 @@ def run_one(model: str, batch_size: int) -> Optional[dict]:
 def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int) -> str:
     def fmt(x): return "NA" if x is None else f"{x:.3f}"
 
-    first_model = next(iter(all_results.values()))
-    first_res = first_model.get(batch_size, {})
-    metrics = first_res.get("metrics", {}) if first_res else {}
-    conf_val = fmt(metrics.get("conf_thres"))
-    iou_val = fmt(metrics.get("iou_thres"))
+    conf_val, iou_val = "NA", "NA"
+    for bs_dict in all_results.values():
+        if batch_size in bs_dict:
+            conf_val, iou_val = get_conf_iou(bs_dict[batch_size])
+            break
 
     header = f"[batch_size : {batch_size}] : conf ({conf_val}), iou ({iou_val})"
     table = [
@@ -285,6 +286,7 @@ def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
     if not by_bs:
         return f"[model : {model}] (no results)\n"
     def fmt(x): return "NA" if x is None else f"{x:.3f}"
+    
     first_metrics = next(iter(by_bs.values())).get("metrics", {})
     conf_val = fmt(first_metrics.get("conf_thres"))
     iou_val = fmt(first_metrics.get("iou_thres"))
@@ -356,10 +358,11 @@ def summarize_transposed_by_batch(all_results: Dict[str, Dict[int, dict]], batch
     def fmt(x): return "NA" if x is None else f"{x:.3f}"
     models = list(all_results.keys())
 
-    # conf/iou는 첫 모델에서 가져오기
-    first_model = next(iter(all_results.values()))
-    first_res = first_model.get(batch_size, {})
-    conf_val, iou_val = get_conf_iou(first_res)
+    conf_val, iou_val = "NA", "NA"
+    for bs_dict in all_results.values():
+        if batch_size in bs_dict:
+            conf_val, iou_val = get_conf_iou(bs_dict[batch_size])
+            break
 
     metrics = [
         "e2e_wall_per_image", "e2e_active", "infer_only",
