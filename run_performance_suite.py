@@ -249,8 +249,9 @@ def run_one(model: str, batch_size: int) -> Optional[dict]:
 
 
 def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int) -> str:
-    def fmt(x): return "NA" if x is None else f"{x:.3f}"
-
+    def fmt(x): 
+        return "NA" if x is None else f"{x:.3f}"
+    
     conf_val, iou_val = "NA", "NA"
     for bs_dict in all_results.values():
         if batch_size in bs_dict:
@@ -259,8 +260,10 @@ def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int)
 
     header = f"[batch_size : {batch_size}] : conf ({conf_val}), iou ({iou_val})"
     table = [
-        "| model | e2e_wall_per_image | e2e_active | infer_only | lat_pre | lat_infer | lat_post | mAP | Target | Status | sec |",
-        "|-------|---------------------|------------|------------|---------|-----------|----------|-----|--------|--------|-----|",
+        "| model | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
+        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
+        "|-------|-----------------------------|--------------------|--------------------|"
+        "----------------|-----------------|----------------|-----|--------|--------|---------|",
     ]
 
     for model, by_bs in all_results.items():
@@ -274,8 +277,11 @@ def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int)
         row = (
             f"| {model} | {fmt(comp.get('e2e_wall_per_image'))} | "
             f"{fmt(thr.get('e2e_active'))} | {fmt(thr.get('infer_only'))} | "
-            f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | {fmt((lat.get('infer',{}) or {}).get('avg'))} | {fmt((lat.get('post',{}) or {}).get('avg'))} | "
-            f"{fmt(m.get('mAP'))} | {fmt(m.get('target'))} | {m.get('status') or 'NA'} | {fmt(m.get('sec'))} |"
+            f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | "
+            f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
+            f"{fmt((lat.get('post',{}) or {}).get('avg'))} | "
+            f"{fmt(m.get('mAP'))} | {fmt(m.get('target'))} | {m.get('status') or 'NA'} | "
+            f"{fmt(m.get('sec'))} |"
         )
         table.append(row)
 
@@ -285,7 +291,8 @@ def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int)
 def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
     if not by_bs:
         return f"[model : {model}] (no results)\n"
-    def fmt(x): return "NA" if x is None else f"{x:.3f}"
+    def fmt(x): 
+        return "NA" if x is None else f"{x:.3f}"
     
     first_metrics = next(iter(by_bs.values())).get("metrics", {})
     conf_val = fmt(first_metrics.get("conf_thres"))
@@ -293,8 +300,10 @@ def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
 
     header = f"[model : {model}] : conf ({conf_val}), iou ({iou_val})"
     table = [
-        "| batch_size | e2e_wall_per_image | e2e_active | infer_only | lat_pre | lat_infer | lat_post | mAP | Target | Status | sec |",
-        "|------------|---------------------|------------|------------|---------|-----------|----------|-----|--------|--------|-----|",
+        "| batch_size | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
+        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
+        "|------------|-----------------------------|--------------------|--------------------|"
+        "----------------|-----------------|----------------|-----|--------|--------|---------|",
     ]
     for bs in sorted(by_bs.keys()):
         res = by_bs[bs]
@@ -305,8 +314,11 @@ def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
         row = (
             f"| {bs} | {fmt(comp.get('e2e_wall_per_image'))} | "
             f"{fmt(thr.get('e2e_active'))} | {fmt(thr.get('infer_only'))} | "
-            f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | {fmt((lat.get('infer',{}) or {}).get('avg'))} | {fmt((lat.get('post',{}) or {}).get('avg'))} | "
-            f"{fmt(metrics.get('mAP'))} | {fmt(metrics.get('target'))} | {metrics.get('status') or 'NA'} | {fmt(metrics.get('sec'))} |"
+            f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | "
+            f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
+            f"{fmt((lat.get('post',{}) or {}).get('avg'))} | "
+            f"{fmt(metrics.get('mAP'))} | {fmt(metrics.get('target'))} | {metrics.get('status') or 'NA'} | "
+            f"{fmt(metrics.get('sec'))} |"
         )
         table.append(row)
     return "\n".join([header, ""] + table + [""])

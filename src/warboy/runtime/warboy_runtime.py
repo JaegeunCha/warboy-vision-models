@@ -29,6 +29,7 @@ class WarboyApplication:
         stream_mux_list: List[PipeLineQueue],
         output_mux_list: List[PipeLineQueue],
         batch_size: int = 1,
+        timings = None,
     ):
         #self.config = {"model": model, "worker_num": worker_num, "npu_device": device}
         #self.model = FuriosaRTModel(
@@ -65,6 +66,8 @@ class WarboyApplication:
 
         self.stream_mux_list = stream_mux_list
         self.output_mux_list = output_mux_list
+
+        self.timings = timings
         print("WarboyApplication - init")
 
     def run(self):
@@ -89,11 +92,26 @@ class WarboyApplication:
         while True:
             t1 = time.time()
             try:
-                input_, _ = stream_mux.get()
+                #input_, _ = stream_mux.get()
+                input_, img_idx = stream_mux.get()
             except QueueClosedError:
                 # print(f"Video-Channel - {video_channel} End!")
                 break
+            t2 = time.perf_counter()
             output = await self.model.predict(input_)
+            t3 = time.perf_counter()
+            
+            infer_ms = (t3 - t2) * 1000.0
+
+            if self.timings is not None:                
+                d = dict(self.timings.get(img_idx, {}))
+                d["infer"] = infer_ms
+                d["t2"] = t2
+                self.timings[img_idx] = d
+
+                if img_idx < 5:
+                    print(f"[Runtime] {img_idx} infer={infer_ms:.3f} ms")
+
             output_mux.put(output)
 
         output_mux.put(StopSig)

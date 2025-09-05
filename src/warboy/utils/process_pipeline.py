@@ -65,6 +65,7 @@ class PipeLine:
         run_e2e_test: bool = False,
         make_image_output: bool = False,
         make_file_output: bool = False,
+        timings = None,
     ):
         self.run_fast_api = run_fast_api
         self.run_e2e_test = run_e2e_test
@@ -91,6 +92,8 @@ class PipeLine:
 
         self.results = []
 
+        self.timings = timings if timings is not None else {}
+
     def add(self, obj, name: str = "", postprocess_as_img=True):
         print(isinstance(obj, Engine))
         if isinstance(obj, Engine):
@@ -98,7 +101,13 @@ class PipeLine:
                 "model": obj.model,
                 "worker_num": obj.worker_num,
                 "device": obj.device,
+                "batch_size": obj.batch_size,
+                "conf_thres": obj.conf_thres,
+                "iou_thres": obj.iou_thres,
             }
+            import json
+            print(f"[Pipeline.add] Engine registered: {json.dumps(self.runtime_info[obj.name], indent=2)}")
+
             if "yolo" in obj.model:
                 self.preprocess_functions[obj.name] = YoloPreProcessor(
                     new_shape=obj.input_shape, tensor_type="uint8"
@@ -197,6 +206,7 @@ class PipeLine:
                     stream_mux=new_stream_mux,
                     frame_mux=new_frame_mux,
                     preprocess_function=self.preprocess_functions[name],
+                    timings=self.timings,
                 )
             )
             # Postprocess (draw bbox for object detection)
@@ -207,6 +217,7 @@ class PipeLine:
                         output_mux=new_output_mux,
                         result_mux=new_result_mux,
                         postprocess_function=self.postprocess_functions[name],
+                        timings=self.timings,
                     )
                 )
             else:
@@ -216,6 +227,7 @@ class PipeLine:
                         output_mux=new_output_mux,
                         result_mux=new_result_mux,
                         postprocess_function=self.postprocess_functions[name],
+                        timings=self.timings,
                     )
                 )
         else:
@@ -230,6 +242,7 @@ class PipeLine:
                     device=runtime_info["device"],
                     stream_mux_list=self.stream_mux_list[name],
                     output_mux_list=self.output_mux_list[name],
+                    timings=self.timings,
                 )
                 for name, runtime_info in self.runtime_info.items()
             ]
