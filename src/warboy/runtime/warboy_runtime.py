@@ -170,25 +170,32 @@ class WarboyApplication:
         def _emit(outputs, infer_ms, t2, B_effective=None):
             """
             B_effective: 추론 시간 분배에 사용할 배치 크기
-            - 정규 배치: len(batch_indices) == self.batch_size
-            - 잔여 패딩 배치: self.batch_size (HW 관점으로 분배)
+            - 정규 배치: len(batch_indices)
+            - 잔여 패딩 배치: self.batch_size (HW 관점 분배)
             """
-            B = B_effective if B_effective is not None else len(batch_indices)
-            for i, idx in enumerate(batch_indices):
-                # 🔍 디버깅: bs>1 구조 확인
+            idxs = list(batch_indices)
+            if not idxs:
+                return
+
+            B = B_effective if B_effective is not None else len(idxs)
+
+            for i, idx in enumerate(idxs):
+                out_i = _per_image(outputs, i)  # ← 먼저 생성
+
+                # 🔍 필요하면 구조만 확인
                 if idx < 2:
                     def _peek(x):
                         if isinstance(x, (list, tuple)):
-                            return [ (getattr(a, 'shape', None)) for a in x ]
+                            return [getattr(a, 'shape', None) for a in x]
                         return getattr(x, 'shape', None)
                     print(f"[DEBUG bs>1] out_i structure: {_peek(out_i)}")
 
-                out_i = _per_image(outputs, i)
                 if self.timings is not None:
                     d = dict(self.timings.get(idx, {}))
                     d["infer"] = infer_ms / B
                     d["t2"] = t2
                     self.timings[idx] = d
+
                 output_mux.put(out_i)
 
         while True:
@@ -225,8 +232,8 @@ class WarboyApplication:
             outputs = await self.model.predict(batch_input)
             t3 = time.perf_counter()
             infer_ms = (t3 - t2) * 1000.0
-            
             _emit(outputs, infer_ms, t2)
+
             batch_inputs, batch_indices = [], []
 
         output_mux.put(StopSig)
