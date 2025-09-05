@@ -1,0 +1,4 @@
+model_list:
+  - yolov8l
+  - yolov9t
+  - yolov9c

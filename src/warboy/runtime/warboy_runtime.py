@@ -8,6 +8,7 @@ from furiosa.server.model import FuriosaRTModel, FuriosaRTModelConfig
 
 from ..utils.queue import PipeLineQueue, QueueClosedError, StopSig
 
+import numpy as np
 
 class WarboyApplication:
     """
@@ -45,7 +46,7 @@ class WarboyApplication:
             }
             self.model = FuriosaRTModel(
                 FuriosaRTModelConfig(
-                    name="YOLO",                    
+                    name="YOLO",                  
                     **self.config
                 )
             )
@@ -63,7 +64,8 @@ class WarboyApplication:
                     **self.config
                 )
             )        
-
+        
+        self.batch_size = batch_size
         self.stream_mux_list = stream_mux_list
         self.output_mux_list = output_mux_list
 
@@ -88,35 +90,148 @@ class WarboyApplication:
     async def inference(
         self, video_channel: int, stream_mux: PipeLineQueue, output_mux: PipeLineQueue
     ):
+        # ✅ batch_size == 1 → 절대 변경하지 않음
+        if self.batch_size == 1:
+            while True:
+                try:
+                    input_, img_idx = stream_mux.get()
+                except QueueClosedError:
+                    break
+
+                t2 = time.perf_counter()
+                output = await self.model.predict(input_)  # 원래대로
+
+                if img_idx < 2:  # 처음 몇 장만
+                    print("[DEBUG bs=1]", type(output), getattr(output, "shape", None))
+                    if isinstance(output, (list, tuple)):
+                        for j, head in enumerate(output):
+                            print(f"  head{j}:", type(head), getattr(head, "shape", None))
+
+                t3 = time.perf_counter()
+                infer_ms = (t3 - t2) * 1000.0
+
+                if self.timings is not None:
+                    d = dict(self.timings.get(img_idx, {}))
+                    d["infer"] = infer_ms
+                    d["t2"] = t2
+                    self.timings[img_idx] = d
+                    if img_idx < 5:
+                        print(f"[Runtime] {img_idx} infer={infer_ms:.3f} ms")
+
+                output_mux.put(output)  # 원래대로
+
+            output_mux.put(StopSig)
+            return
+
+        # ✅ batch_size > 1 → 배치 모드
+        batch_inputs, batch_indices = [], []
+
+        def _norm_head_per_image(head: np.ndarray, i: int):
+            """
+            배치 ENF가 평탄화해서 내보내는 head를
+            postprocessor가 기대하는 (1, C, H, W)로 되돌린다.
+            """
+            if not isinstance(head, np.ndarray):
+                return head
+
+            arr = head
+
+            # 1) 배치축이 있는 경우 per-image로 슬라이스
+            if arr.ndim == 4 and arr.shape[0] > i:
+                # (B, C, H, W) → (1, C, H, W)
+                return arr[i:i+1]
+            if arr.ndim == 3 and arr.shape[0] == self.batch_size and arr.shape[0] > i:
+                # (B, C*H, W) 같은 형태 → i 슬라이스 후 아래에서 복원
+                arr = arr[i]
+
+            # 2) per-image 상태에서 모양 복원
+            if arr.ndim == 3:
+                # (C, H, W) → (1, C, H, W)
+                return arr[None, ...]
+            if arr.ndim == 2:
+                # (C*H, W) → (1, C, H, W), 여기서 H=W 가정
+                W = arr.shape[1]
+                H = W
+                C = arr.shape[0] // H if H > 0 else 0
+                if C * H == arr.shape[0] and C > 0:
+                    return arr.reshape(1, C, H, W)
+                return arr
+
+            return arr
+
+        def _per_image(outputs, i):
+            if isinstance(outputs, (list, tuple)):
+                fixed = [ _norm_head_per_image(h, i) for h in outputs ]
+                return type(outputs)(fixed)
+            if isinstance(outputs, np.ndarray):
+                return _norm_head_per_image(outputs, i)
+            return outputs
+
+        def _emit(outputs, infer_ms, t2, B_effective=None):
+            """
+            B_effective: 추론 시간 분배에 사용할 배치 크기
+            - 정규 배치: len(batch_indices) == self.batch_size
+            - 잔여 패딩 배치: self.batch_size (HW 관점으로 분배)
+            """
+            B = B_effective if B_effective is not None else len(batch_indices)
+            for i, idx in enumerate(batch_indices):
+                # 🔍 디버깅: bs>1 구조 확인
+                if idx < 2:
+                    def _peek(x):
+                        if isinstance(x, (list, tuple)):
+                            return [ (getattr(a, 'shape', None)) for a in x ]
+                        return getattr(x, 'shape', None)
+                    print(f"[DEBUG bs>1] out_i structure: {_peek(out_i)}")
+
+                out_i = _per_image(outputs, i)
+                if self.timings is not None:
+                    d = dict(self.timings.get(idx, {}))
+                    d["infer"] = infer_ms / B
+                    d["t2"] = t2
+                    self.timings[idx] = d
+                output_mux.put(out_i)
 
         while True:
-            t1 = time.time()
             try:
-                #input_, _ = stream_mux.get()
                 input_, img_idx = stream_mux.get()
+                batch_inputs.append(input_)
+                batch_indices.append(img_idx)
+
+                if len(batch_inputs) < self.batch_size:
+                    continue
+
             except QueueClosedError:
-                # print(f"Video-Channel - {video_channel} End!")
+                if batch_inputs:
+                    actual = len(batch_inputs)
+                    if actual < self.batch_size:
+                        pad_needed = self.batch_size - actual
+                        batch_inputs_padded = batch_inputs + [batch_inputs[-1]] * pad_needed
+                    else:
+                        batch_inputs_padded = batch_inputs
+
+                    batched_input = np.concatenate(batch_inputs_padded, axis=0)  # (B,C,H,W)
+                    t2 = time.perf_counter()
+                    outputs = await self.model.predict(batched_input)
+                    t3 = time.perf_counter()
+                    infer_ms = (t3 - t2) * 1000.0
+
+                    # 패딩 실행 → 분배는 B=self.batch_size 기준
+                    _emit(outputs, infer_ms, t2, B_effective=self.batch_size)
                 break
+
+            # 정규 배치 실행
+            batch_input = np.concatenate(batch_inputs, axis=0)  # (B,C,H,W)
             t2 = time.perf_counter()
-            output = await self.model.predict(input_)
+            outputs = await self.model.predict(batch_input)
             t3 = time.perf_counter()
-            
             infer_ms = (t3 - t2) * 1000.0
-
-            if self.timings is not None:                
-                d = dict(self.timings.get(img_idx, {}))
-                d["infer"] = infer_ms
-                d["t2"] = t2
-                self.timings[img_idx] = d
-
-                if img_idx < 5:
-                    print(f"[Runtime] {img_idx} infer={infer_ms:.3f} ms")
-
-            output_mux.put(output)
+            
+            _emit(outputs, infer_ms, t2)
+            batch_inputs, batch_indices = [], []
 
         output_mux.put(StopSig)
         return
-
+    
     async def load(self):
         await self.model.load()
 

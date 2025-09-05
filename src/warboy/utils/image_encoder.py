@@ -3,7 +3,7 @@ from typing import Callable
 
 from .queue import PipeLineQueue, QueueClosedError, StopSig
 
-
+import numpy as np
 class ImageEncoder:
     def __init__(
         self,
