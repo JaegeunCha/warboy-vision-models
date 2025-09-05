@@ -21,6 +21,7 @@ from ..utils import (
     MSCOCODataLoader,
     set_test_engin_configs,
     xyxy2xywh,
+    Manager,
 )
 
 # ------------------------------------------------------
@@ -372,81 +373,66 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
     else:
         model_path = param.get("onnx_i8_path") or os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"])
 
-    # 전/후처리
-    preprocessor = YoloPreProcessor(new_shape=input_shape[2:])
-    postprocessor = ObjDetPostprocess(
-        model_name, {"conf_thres": conf_thres, "iou_thres": iou_thres, "anchors": anchors},
-        None, False
-    ).postprocess_func
+    # 이미지 준비
+    image_names = os.listdir(image_dir)
+    images = [Image(image_info=os.path.join(image_dir, n)) for n in image_names]
 
-    # COCO
+    preprocessor = YoloPreProcessor(new_shape=input_shape[2:])
     data_loader = MSCOCODataLoader(Path(image_dir), Path(annotation_file), preprocessor, input_shape)
 
-    # 추론
+    # shared timings
+    manager = Manager()
+    TIMINGS = manager.dict()
+
+    # Pipeline
+    task = PipeLine(run_fast_api=False, run_e2e_test=True, num_channels=len(images), timings=TIMINGS)
+    for idx, engin in enumerate(engin_configs):
+        engin["model"] = model_path
+        task.add(Engine(**engin, batch_size=batch_size), postprocess_as_img=False)
+        task.add(ImageList([image for image in images[idx::len(engin_configs)]]),
+                 name=engin["name"], postprocess_as_img=False)
+
     wall_start = time.time()
-    metrics, results = asyncio.run(
-        _inference_with_metrics(model_path, data_loader, preprocessor, postprocessor, batch_size=batch_size)
-    )
+    task.run()
     wall_elapsed = time.time() - wall_start
+
     print(f"Inference Done in {wall_elapsed:.2f} sec")
 
-    # 요약 함수 (avg/p50/p90/p99 모두 반환)
-    def summarize(xs: List[float]):
-        avg, p50, p90, p99 = quantiles(xs)
-        return {"avg": avg, "p50": p50, "p90": p90, "p99": p99}
+    # 결과/latency 요약
+    pre_list, infer_list, post_list, e2e_active_list, e2e_wall_list = [], [], [], [], []
+    for timings in TIMINGS.values():
+        if "pre" in timings: pre_list.append(timings["pre"])
+        if "infer" in timings: infer_list.append(timings["infer"])
+        if "post" in timings: post_list.append(timings["post"])
+        if "e2e_active" in timings: e2e_active_list.append(timings["e2e_active"])
+        if "e2e" in timings: e2e_wall_list.append(timings["e2e"])
 
-    # 요약 지표
-    e2e_active = summarize(metrics["e2e_active"])   # 대기 제외 per-image
-    e2e_wall   = summarize(metrics["e2e_wall"])     # 대기 포함 per-image
-    inf        = summarize(metrics["inf"])
-    pre        = summarize(metrics["pre"])
-    post       = summarize(metrics["post"])
-
-    # 대기시간(= e2e_wall - e2e_active)
-    wait_ms_list = [w - a for w, a in zip(metrics["e2e_wall"], metrics["e2e_active"])]
-    wait = summarize(wait_ms_list)
-    wait_ratio = (wait["avg"] / e2e_wall["avg"]) if (wait["avg"] and e2e_wall["avg"]) else None
-
-    # 처리량(1장 기준만 기본 표기)
-    ips_e2e_active     = (1000.0 / e2e_active["avg"]) if e2e_active["avg"] else None
-    ips_inf            = (1000.0 / inf["avg"])        if inf["avg"]        else None
-    ips_e2e_wall_imgps = (1000.0 / e2e_wall["avg"])   if e2e_wall["avg"]   else None
-
-    # (옵션) 데이터셋 전체 처리량 & NPU 배치 처리량
-    dataset_throughput_wall = (len(metrics["e2e_active"]) / wall_elapsed) if wall_elapsed > 0 else None
-    total_imgs_in_batches   = sum(b["n"] for b in metrics["batch_exec"])
-    total_infer_ms_batches  = sum(b["infer_ms"] for b in metrics["batch_exec"])
-    hardware_batch_throughput = (
-        (1000.0 * total_imgs_in_batches) / total_infer_ms_batches
-        if total_infer_ms_batches > 0 else None
-    )
+    def summarize(xs): return {"avg": np.mean(xs), "p50": np.median(xs)} if xs else {}
 
     summary = {
         "model": model_path,
         "cfg": config_file,
-        "images": len(metrics["e2e_active"]),
-        "throughput_img_per_s": {  # 항상 '1장 기준'만 표기
-            "e2e_active": ips_e2e_active,         # 권장 비교 지표
-            "infer_only": ips_inf,                # 순수 NPU per-image
-            "e2e_wall_per_image": ips_e2e_wall_imgps  # 대기 포함 per-image
+        "images": len(pre_list),
+        "throughput_img_per_s": {
+            "e2e_active": 1000.0 / summarize(e2e_active_list).get("avg", np.nan),
+            "infer_only": 1000.0 / summarize(infer_list).get("avg", np.nan),
+            "e2e_wall_per_image": 1000.0 / summarize(e2e_wall_list).get("avg", np.nan),
         },
         "latency_ms": {
-            "pre": pre, "infer": inf, "post": post,
-            "e2e_active": e2e_active, "e2e_wall": e2e_wall,
-            "wait": wait, "wait_ratio": wait_ratio
+            "pre": summarize(pre_list),
+            "infer": summarize(infer_list),
+            "post": summarize(post_list),
+            "e2e_active": summarize(e2e_active_list),
+            "e2e_wall": summarize(e2e_wall_list),
         },
-        "dataset": {  # 해석용 보조 지표 (필요 시 참조)
-            "throughput_wall_img_per_s": dataset_throughput_wall,
-            "hardware_batch_throughput_img_per_s": hardware_batch_throughput
+        "dataset": {
+            "throughput_wall_img_per_s": len(pre_list) / wall_elapsed if wall_elapsed > 0 else None
         }
     }
-
     print(json.dumps(summary, indent=2))
-    Path("outputs").mkdir(exist_ok=True)
-    with open("outputs/results.json", "w") as f:
-        json.dump(summary, f, indent=2)
 
     # COCO mAP
+    results = _process_outputs(task.outputs, data_loader)
     coco_result = data_loader.coco.loadRes(results)
     coco_eval = COCOeval(data_loader.coco, coco_result, "bbox")
     coco_eval.evaluate(); coco_eval.accumulate(); coco_eval.summarize()

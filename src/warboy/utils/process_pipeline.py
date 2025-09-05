@@ -32,6 +32,7 @@ class Engine:
     input_shape: Tuple[int, int] = (640, 640)
     anchors = [None]
     use_tracking: bool = True
+    batch_size: int = 1
 
     def _get_runtime_info(self):
         return

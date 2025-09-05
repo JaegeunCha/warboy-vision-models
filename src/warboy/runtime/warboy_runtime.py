@@ -28,11 +28,41 @@ class WarboyApplication:
         device: str,
         stream_mux_list: List[PipeLineQueue],
         output_mux_list: List[PipeLineQueue],
+        batch_size: int = 1,
     ):
-        self.config = {"model": model, "worker_num": worker_num, "npu_device": device}
-        self.model = FuriosaRTModel(
-            FuriosaRTModelConfig(name="YOLO", batch_size=1, **self.config)
-        )
+        #self.config = {"model": model, "worker_num": worker_num, "npu_device": device}
+        #self.model = FuriosaRTModel(
+        #    FuriosaRTModelConfig(name="YOLO", batch_size=1, **self.config)
+        #)
+        
+        if model.endswith(".enf"):
+            print(f"[WarboyApplication] Loading precompiled ENF: {model}")
+            self.config = {
+                "model": model,
+                "worker_num": worker_num,
+                "npu_device": device,
+            }
+            self.model = FuriosaRTModel(
+                FuriosaRTModelConfig(
+                    name="YOLO",                    
+                    **self.config
+                )
+            )
+        else:
+            print(f"[WarboyApplication] Loading ONNX (will compile): {model}")
+            self.config = {
+                "model": model,
+                "worker_num": worker_num,
+                "npu_device": device,
+            }
+            self.model = FuriosaRTModel(
+                FuriosaRTModelConfig(
+                    name="YOLO",
+                    batch_size=batch_size,
+                    **self.config
+                )
+            )        
+
         self.stream_mux_list = stream_mux_list
         self.output_mux_list = output_mux_list
         print("WarboyApplication - init")
