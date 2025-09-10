@@ -95,11 +95,12 @@ def get_e2e_wall_imgps(res: dict) -> Optional[float]:
     return thr.get("e2e_wall_per_image")  # may be None on old versions
 
 
-def run_cmd_stream(cmd: List[str]) -> Tuple[int, List[str]]:
+def run_cmd_stream(cmd: List[str]) -> Tuple[int, List[str], bool]:
     log_line(f"RUN: {' '.join(cmd)}")
 
     lines: List[str] = []
     panic_detected = False
+    oom_detected = False
     with FULL_LOG_FILE.open("a", encoding="utf-8") as f:
         proc = subprocess.Popen(
             cmd,
@@ -114,7 +115,14 @@ def run_cmd_stream(cmd: List[str]) -> Tuple[int, List[str]]:
             sys.stdout.write(line)
             f.write(line)
             lines.append(line)
-            if "Not enough memory" in line or "panicked at" in line:
+
+            if "Not enough memory" in line:
+                oom_detected = True
+                log_line(f"[OOM DETECTED] {line.strip()}")
+                try: proc.kill()
+                except Exception: pass
+                break
+            if "panicked at" in line:
                 panic_detected = True
                 log_line(f"[PANIC DETECTED] {line.strip()}")
                 try: proc.kill()
@@ -124,7 +132,8 @@ def run_cmd_stream(cmd: List[str]) -> Tuple[int, List[str]]:
         rc = proc.returncode
     if panic_detected:
         rc = rc or 99
-    return rc, lines
+    return rc, lines, oom_detected
+
 
 def extract_result_json(lines: List[str]) -> Optional[dict]:
     text = "".join(lines)
@@ -191,18 +200,35 @@ def ensure_cfg_yaml(model: str, cfg_dir: Path):
 def run_one(model: str, batch_size: int) -> Optional[dict]:
     base = base_model_name(model)
     cfg_path = ensure_cfg_yaml(base, CFG_DIR)
-    rc, lines = run_cmd_stream([
-        "warboy-vision","model-performance","--config_file",str(cfg_path),"--batch-size",str(batch_size)
-    ])
-    if rc != 0: 
-        log_line(f"[WARN] model-performance failed (rc={rc}) for {model} bs={batch_size}")
-        return None
 
+    retries = 3
+    for attempt in range(retries):
+        rc, lines, oom = run_cmd_stream([
+            "warboy-vision","model-performance",
+            "--config_file",str(cfg_path),"--batch-size",str(batch_size)
+        ])
+
+        if oom:
+            try:
+                subprocess.run(["pkill", "-f", "warboy-vision model-performance"], check=False)
+                log_line(f"[CLEANUP] OOM occurred, killed leftover processes for {model} bs={batch_size}")
+            except Exception as e:
+                log_line(f"[CLEANUP ERROR] {e}")
+            return None 
+
+        if rc == 0:
+            break
+        log_line(f"[WARN] Attempt {attempt+1}/{retries} failed (rc={rc})")
+
+    if rc != 0:
+        log_line(f"[ERROR] model-performance failed after {retries} attempts for {model} bs={batch_size}")
+        return None
+      
     result = extract_result_json(lines)
     if result is None:
         log_line(f"[WARN] JSON result not found for {model} bs={batch_size}")
         return None
-
+    
     # parse extra metrics
     conf_thres = iou_thres = sec = mAP = target = None
     status = None
@@ -443,11 +469,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--detach", action="store_true")
     args = parser.parse_args()
+    delay = 5
+    
     log_line("="*80)
     log_line(f"===== Run started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====")
     log_line(f"Full log file: {FULL_LOG_FILE}")
     log_line(f"Result log file: {RESULT_LOG_FILE}")
     log_line("="*80)
+
+    try:
+        subprocess.run(["pkill", "-f", "warboy-vision model-performance"], check=False)
+        log_line("[CLEANUP] Killed leftover 'warboy-vision model-performance' processes")
+    except Exception as e:
+        log_line(f"[CLEANUP ERROR] {e}")
+
+    time.sleep(delay)
 
     models = discover_models_from_enf(ENF_DIR)
     log_line(f"Models to process: {models}")
