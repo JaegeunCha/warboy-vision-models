@@ -80,22 +80,27 @@ class PredictionEncoder:
                     e2e_active = pre_ms + infer_ms + post_ms
                     d["e2e_active"] = e2e_active
 
-                    # e2e_wall
-                    t0 = d.get("t0")
-                    if t0 is not None:
-                        e2e_wall_val = (time.perf_counter() - t0) * 1000.0
-                        d["e2e"] = e2e_wall_val
-                    else:
-                        e2e_wall_val = None
+                    ## e2e_wall
+                    #t0 = d.get("t0")
+                    #if t0 is not None:
+                    #    wall_ms = (time.perf_counter() - t0) * 1000.0
+                    #    B = d.get("batch_size", 1)                        
+                    #    d["e2e"] = wall_ms / max(B, 1)   
+                    #else:
+                    #    d["e2e"] = None
 
                     self.timings[img_idx] = d
 
                     if img_idx < 5:
-                        e2e_wall_str = f"{e2e_wall_val:.3f} ms" if e2e_wall_val else "NA"
+                        #e2e_wall_str = f"{e2e_wall_val:.3f} ms" if e2e_wall_val else "NA"
+                        #print(f"[Encoder] {img_idx} post={post_ms:.3f} ms "
+                        #    f"e2e_active={e2e_active:.3f} ms "
+                        #    f"e2e_wall={e2e_wall_str}")
+                        e2e_val = d.get("e2e")
+                        e2e_wall_str = f"{e2e_val:.3f} ms" if e2e_val is not None else "NA"
                         print(f"[Encoder] {img_idx} post={post_ms:.3f} ms "
-                            f"e2e_active={e2e_active:.3f} ms "
-                            f"e2e_wall={e2e_wall_str}")
-                    
+                              f"e2e_active={e2e_active:.3f} ms "
+                              f"e2e_wall={e2e_wall_str}")                    
                 if not self.result_mux is None:
                     self.result_mux.put((preds, 0.0, img_idx))
             except QueueClosedError:

@@ -194,6 +194,7 @@ class WarboyApplication:
                     d = dict(self.timings.get(idx, {}))
                     d["infer"] = infer_ms / B
                     d["t2"] = t2
+                    d["batch_size"] = B
                     self.timings[idx] = d
 
                 output_mux.put(out_i)

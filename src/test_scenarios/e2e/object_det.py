@@ -212,16 +212,19 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
     print(f"Inference Done in {wall_elapsed:.2f} sec")
 
     # latency 요약
-    pre_list, infer_list, post_list, e2e_active_list, e2e_wall_list = [], [], [], [], []
+    #pre_list, infer_list, post_list, e2e_active_list, e2e_wall_list = [], [], [], [], []
+    pre_list, infer_list, post_list, e2e_active_list = [], [], [], []
     for timings in TIMINGS.values():
         if "pre" in timings: pre_list.append(timings["pre"])
         if "infer" in timings: infer_list.append(timings["infer"])
         if "post" in timings: post_list.append(timings["post"])
         if "e2e_active" in timings: e2e_active_list.append(timings["e2e_active"])
-        if "e2e" in timings: e2e_wall_list.append(timings["e2e"])
 
     def summarize(xs): 
         return {"avg": float(np.mean(xs)), "p50": float(np.median(xs))} if xs else {}
+
+    #num_imgs = len(pre_list)
+    #e2e_wall_per_image = num_imgs / wall_elapsed if wall_elapsed > 0 else None
 
     summary = {
         "model": model_name,  # 파일 경로 대신 모델명만
@@ -230,17 +233,15 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
         "throughput_img_per_s": {
             "e2e_active": 1000.0 / summarize(e2e_active_list).get("avg", np.nan),
             "infer_only": 1000.0 / summarize(infer_list).get("avg", np.nan),
-            "e2e_wall_per_image": 1000.0 / summarize(e2e_wall_list).get("avg", np.nan),
+            #"e2e_wall_per_image": 1000.0 / summarize(e2e_wall_list).get("avg", np.nan),
+            #"e2e_wall_per_image": e2e_wall_per_image,
         },
         "latency_ms": {
             "pre": summarize(pre_list),
             "infer": summarize(infer_list),
             "post": summarize(post_list),
             "e2e_active": summarize(e2e_active_list),
-            "e2e_wall": summarize(e2e_wall_list),
-        },
-        "dataset_img_per_s": {
-            "throughput_wall": len(pre_list) / wall_elapsed if wall_elapsed > 0 else None
+            #"e2e_wall": summarize(e2e_wall_list),
         }
     }
     print(json.dumps(summary, indent=2))

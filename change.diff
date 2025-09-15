@@ -1,0 +1,1959 @@
+diff --git a/build_enf_batchsize.py b/build_enf_batchsize.py
+new file mode 100644
+index 0000000..50568b9
+--- /dev/null
++++ b/build_enf_batchsize.py
+@@ -0,0 +1,173 @@
++#!/usr/bin/env python3
++"""
++Automate YOLO -> ONNX -> INT8 -> ENF build pipeline for warboy-vision-models.
++
++Update:
++- Compiler failure now logs a warning and skips to next instead of raising RuntimeError.
++- Spinner is preserved for console feedback, but spinner characters are not written to log file.
++"""
++from __future__ import annotations
++import argparse
++import os
++import sys
++import yaml
++import shutil
++import subprocess
++from pathlib import Path
++from datetime import datetime
++import itertools, time, threading
++
++BATCH_SIZES = [None]
++DEFAULT_TASK = "object_detection"
++DEFAULT_TEMPLATE_CFG = Path("tutorials/cfg/yolov8n.yaml")
++CFG_DIR = Path("tutorials/cfg")
++MODELS_DIR = Path("../models")
++WEIGHT_DIR = MODELS_DIR / "weight" / DEFAULT_TASK
++ONNX_DIR = MODELS_DIR / "onnx" / DEFAULT_TASK
++QONNX_DIR = MODELS_DIR / "quantized_onnx" / DEFAULT_TASK
++ENF_DIR = MODELS_DIR / "enf" / DEFAULT_TASK
++MODEL_LIST_FILE = Path("model-list.yaml")
++CALIB_DATA = Path("../datasets/coco/val2017")
++LOG_FILE = Path("pipeline.log")
++
++def log(msg: str):
++    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
++    line = f"[{ts}] {msg}"
++    print(line, flush=True)
++    try:
++        with LOG_FILE.open("a", encoding="utf-8") as f:
++            f.write(line + "\n")
++    except Exception:
++        pass
++
++def run_cmd(cmd: list[str], cwd: Path | None = None) -> int:
++    log(f"RUN: {' '.join(cmd)} (cwd={cwd or Path.cwd()})")
++    with LOG_FILE.open("a", encoding="utf-8") as f:
++        proc = subprocess.Popen(
++            cmd,
++            cwd=str(cwd) if cwd else None,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True,
++            bufsize=1,
++        )
++        assert proc.stdout is not None
++        for line in proc.stdout:
++            # write only to console, not spinner chars to log
++            sys.stdout.write(line)
++            f.write(line)
++        proc.wait()
++        return proc.returncode
++
++def read_model_list(path: Path) -> list[str]:
++    with path.open("r", encoding="utf-8") as f:
++        data = yaml.safe_load(f) or {}
++    return data.get("model_list", [])
++
++def ensure_cfg_for_model(model: str, template_cfg: Path = DEFAULT_TEMPLATE_CFG) -> Path:
++    CFG_DIR.mkdir(parents=True, exist_ok=True)
++    cfg_path = CFG_DIR / f"{model}.yaml"
++    if not cfg_path.exists():
++        shutil.copyfile(template_cfg, cfg_path)
++        log(f"Created cfg from template: {cfg_path}")
++    with cfg_path.open("r", encoding="utf-8") as f:
++        cfg = yaml.safe_load(f) or {}
++    cfg["task"] = DEFAULT_TASK
++    cfg["model_name"] = model
++    cfg["weight"] = str(WEIGHT_DIR / f"{model}.pt")
++    cfg["onnx_path"] = str(ONNX_DIR / f"{model}.onnx")
++    cfg["onnx_i8_path"] = str(QONNX_DIR / f"{model}_i8.onnx")
++    cfg["calibration_params"] = {
++        "calibration_method": "SQNR_ASYM",
++        "calibration_data": str(CALIB_DATA),
++        "num_calibration_data": 100,
++    }
++    with cfg_path.open("w", encoding="utf-8") as f:
++        yaml.safe_dump(cfg, f, sort_keys=False)
++    return cfg_path
++
++def expected_paths_for_model(model: str) -> dict[str, Path]:
++    return {
++        "weight": WEIGHT_DIR / f"{model}.pt",
++        "onnx": ONNX_DIR / f"{model}.onnx",
++        "qonnx": QONNX_DIR / f"{model}_i8.onnx",
++        "enf_1": ENF_DIR / f"{model}.enf",
++        "enf_4": ENF_DIR / f"{model}_4b.enf",
++        "enf_8": ENF_DIR / f"{model}_8b.enf",
++        "enf_16": ENF_DIR / f"{model}_16b.enf",
++        "enf_32": ENF_DIR / f"{model}_32b.enf",
++    }
++
++def spinner(msg="컴파일 중..."):
++    stop_flag = {"done": False}
++    def run():
++        for c in itertools.cycle('|/-\\'):
++            if stop_flag["done"]:
++                break
++            sys.stderr.write(f'\r{msg} {c}')
++            sys.stderr.flush()
++            time.sleep(0.2)
++        sys.stderr.write('\r완료!     \n')
++        sys.stderr.flush()
++    t = threading.Thread(target=run)
++    t.daemon = True
++    t.start()
++    return lambda: stop_flag.update({"done": True})
++
++def compile_enf_for_model(model: str, qonnx: Path):
++    ENF_DIR.mkdir(parents=True, exist_ok=True)
++
++    # BATCH_SIZES 기반 출력 경로 정의
++    batch_map = {
++        bs: (ENF_DIR / f"{model}.enf" if bs is None else ENF_DIR / f"{model}_{bs}b.enf")
++        for bs in BATCH_SIZES
++    }
++
++    for bs, out_path in batch_map.items():
++        if out_path.exists():
++            log(f"[SKIP] ENF exists for {model} batch={1 if bs is None else bs}")
++            continue
++
++        cmd = ["furiosa-compiler", str(qonnx), "-o", str(out_path),
++               "--target-npu", "warboy"]   # ✅ 64 DPES 장치 맞춤 설정 추가
++
++        if bs is not None:  # batch=1(None)은 옵션 안 붙음
++            cmd += ["--batch-size", str(bs)]
++
++        rc = run_cmd(cmd)
++        if rc != 0 or not out_path.exists():
++            log(f"[WARN] Compiler failed for {out_path}, skipping.")
++            continue
++        log(f"[OK] Compiled ENF: {out_path}")
++
++def export_and_quantize(cfg_path: Path, model: str, onnx: Path, qonnx: Path):
++    if not onnx.exists():
++        run_cmd(["warboy-vision", "export-onnx", "--config_file", str(cfg_path)])
++    else:
++        log(f"[SKIP] ONNX exists: {onnx}")
++    if not qonnx.exists():
++        run_cmd(["warboy-vision", "quantize", "--config_file", str(cfg_path)])
++    else:
++        log(f"[SKIP] Quantized ONNX exists: {qonnx}")
++
++def main():
++    models = read_model_list(MODEL_LIST_FILE)
++    log(f"Models to process: {models}")
++    for model in models:
++        log("=" * 80)
++        log(f"PROCESS MODEL: {model}")
++        paths = expected_paths_for_model(model)
++        enf_files = [paths["enf_1"], paths["enf_4"], paths["enf_8"], paths["enf_16"], paths["enf_32"]]
++        if all(p.exists() for p in enf_files):
++            log(f"[SKIP] All ENFs already exist for {model}")
++            continue
++        cfg_path = ensure_cfg_for_model(model)
++        if not paths["weight"].exists():
++            log(f"[WARN] Missing weight: {paths['weight']}")
++            continue
++        export_and_quantize(cfg_path, model, paths["onnx"], paths["qonnx"])
++        compile_enf_for_model(model, paths["qonnx"])
++    log("All done.")
++
++if __name__ == "__main__":
++    main()
+diff --git a/model-list.yaml b/model-list.yaml
+new file mode 100644
+index 0000000..e05e6d3
+--- /dev/null
++++ b/model-list.yaml
+@@ -0,0 +1,4 @@
++model_list:
++  - yolov8l
++  - yolov9t
++  - yolov9c
+diff --git a/output/1.jpg b/output/1.jpg
+new file mode 100644
+index 0000000..203d7c6
+Binary files /dev/null and b/output/1.jpg differ
+diff --git a/output/10.jpg b/output/10.jpg
+new file mode 100644
+index 0000000..aed8954
+Binary files /dev/null and b/output/10.jpg differ
+diff --git a/output/2.jpg b/output/2.jpg
+new file mode 100644
+index 0000000..8fe9917
+Binary files /dev/null and b/output/2.jpg differ
+diff --git a/output/3.jpg b/output/3.jpg
+new file mode 100644
+index 0000000..2c5dcce
+Binary files /dev/null and b/output/3.jpg differ
+diff --git a/output/4.jpg b/output/4.jpg
+new file mode 100644
+index 0000000..05ebe4f
+Binary files /dev/null and b/output/4.jpg differ
+diff --git a/output/5.jpg b/output/5.jpg
+new file mode 100644
+index 0000000..6155b09
+Binary files /dev/null and b/output/5.jpg differ
+diff --git a/output/6.jpg b/output/6.jpg
+new file mode 100644
+index 0000000..b296ee2
+Binary files /dev/null and b/output/6.jpg differ
+diff --git a/output/7.jpg b/output/7.jpg
+new file mode 100644
+index 0000000..1aa01e7
+Binary files /dev/null and b/output/7.jpg differ
+diff --git a/output/8.jpg b/output/8.jpg
+new file mode 100644
+index 0000000..b15cdd5
+Binary files /dev/null and b/output/8.jpg differ
+diff --git a/output/9.jpg b/output/9.jpg
+new file mode 100644
+index 0000000..1805172
+Binary files /dev/null and b/output/9.jpg differ
+diff --git a/run_performance_suite.py b/run_performance_suite.py
+new file mode 100644
+index 0000000..b24d0e3
+--- /dev/null
++++ b/run_performance_suite.py
+@@ -0,0 +1,504 @@
++#!/usr/bin/env python3
++"""
++Run warboy-vision model-performance for available ENF batch sizes per model,
++log results, print progress to console, and optionally run detached.
++
++- Detects models by scanning ../models/enf/object_detection/*.enf
++- Always uses tutorials/cfg/<base>.yaml
++- Runs: warboy-vision model-performance --config_file tutorials/cfg/<base>.yaml --batch-size <bs>
++- Captures JSON + parses extra metrics (mAP, thresholds, inference sec)
++- Summarizes results in Markdown tables
++"""
++
++from __future__ import annotations
++import argparse, json, os, re, subprocess, sys, time, itertools, threading
++from pathlib import Path
++from datetime import datetime
++from typing import Dict, List, Optional, Tuple
++import yaml
++
++# -----------------------------
++# Constants
++# -----------------------------
++REPO_ROOT = Path.cwd()
++CFG_DIR = REPO_ROOT / "tutorials" / "cfg"
++ENF_DIR = REPO_ROOT / ".." / "models" / "enf" / "object_detection"
++
++# 실행 시점 기반 로그 파일명
++START_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
++FULL_LOG_FILE = REPO_ROOT / f"performance_full_{START_TS}.log"   # 전체 로그
++RESULT_LOG_FILE = REPO_ROOT / f"performance_result_{START_TS}.log"  # 요약 로그
++
++BATCH_MAP = {
++    1: "{model}.enf",
++    4: "{model}_4b.enf",
++    8: "{model}_8b.enf",
++    16: "{model}_16b.enf",
++    32: "{model}_32b.enf",
++}
++
++# -----------------------------
++# Logging helpers
++# -----------------------------
++def log_line(msg: str, both: bool = True):
++    if msg == "":  # 빈 문자열이면 그냥 개행
++        if both:
++            print("", flush=True)
++        try:
++            with FULL_LOG_FILE.open("a", encoding="utf-8") as f:
++                f.write("\n")
++        except Exception:
++            pass
++        return
++
++    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
++    line = f"[{ts}] {msg}"
++    if both:
++        print(line, flush=True)
++    try:
++        with FULL_LOG_FILE.open("a", encoding="utf-8") as f:
++            f.write(line + "\n")
++    except Exception:
++        pass
++
++# -----------------------------
++# Utilities
++# -----------------------------
++def base_model_name(model: str) -> str:
++    return re.sub(r"_\d+b$", "", model)
++
++def discover_models_from_enf(enf_dir: Path) -> list[str]:
++    models = set()
++    for enf in enf_dir.glob("*.enf"):
++        models.add(base_model_name(enf.stem))
++    return sorted(models)
++
++def available_batches_for_model(model: str) -> List[int]:
++    bs_list: List[int] = []
++    for bs, pat in BATCH_MAP.items():
++        enf_path = ENF_DIR / pat.format(model=model)
++        if enf_path.exists():
++            bs_list.append(bs)
++    return sorted(bs_list)
++
++def get_e2e_wall_imgps(res: dict) -> Optional[float]:
++    """
++    Return per-image wall throughput (img/s).
++    Primary: 1000 / latency_ms.e2e_wall.avg
++    Fallback: throughput_img_per_s.e2e_wall_per_image (if provided by runner)
++    """
++    lat = res.get("latency_ms", {})
++    e2e_wall_avg = (lat.get("e2e_wall") or {}).get("avg")
++    if e2e_wall_avg and e2e_wall_avg > 0:
++        return 1000.0 / e2e_wall_avg
++    thr = res.get("throughput_img_per_s", {})
++    return thr.get("e2e_wall_per_image")  # may be None on old versions
++
++
++def run_cmd_stream(cmd: List[str]) -> Tuple[int, List[str]]:
++    log_line(f"RUN: {' '.join(cmd)}")
++
++    lines: List[str] = []
++    panic_detected = False
++    with FULL_LOG_FILE.open("a", encoding="utf-8") as f:
++        proc = subprocess.Popen(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True,
++            bufsize=1,
++            cwd=str(REPO_ROOT),
++        )
++        assert proc.stdout is not None
++        for line in proc.stdout:
++            sys.stdout.write(line)
++            f.write(line)
++            lines.append(line)
++            if "Not enough memory" in line or "panicked at" in line:
++                panic_detected = True
++                log_line(f"[PANIC DETECTED] {line.strip()}")
++                try: proc.kill()
++                except Exception: pass
++                break
++        proc.wait(timeout=5)
++        rc = proc.returncode
++    if panic_detected:
++        rc = rc or 99
++    return rc, lines
++
++def extract_result_json(lines: List[str]) -> Optional[dict]:
++    text = "".join(lines)
++    candidates: List[str] = []
++    stack = 0; start_idx = None
++    for i, ch in enumerate(text):
++        if ch == '{':
++            if stack == 0: start_idx = i
++            stack += 1
++        elif ch == '}':
++            if stack > 0:
++                stack -= 1
++                if stack == 0 and start_idx is not None:
++                    candidates.append(text[start_idx:i+1]); start_idx = None
++    for snippet in reversed(candidates):
++        try: obj = json.loads(snippet)
++        except Exception: continue
++        if isinstance(obj, dict) and "throughput_img_per_s" in obj:
++            return obj
++    return None
++
++# -----------------------------
++# Cfg file generator
++# -----------------------------
++COCO_CLASSES = [ "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
++ "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse",
++ "sheep","cow","elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase",
++ "frisbee","skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard",
++ "surfboard","tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl","banana",
++ "apple","sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","couch",
++ "potted plant","bed","dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone",
++ "microwave","oven","toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear",
++ "hair drier","toothbrush" ]
++
++def ensure_cfg_yaml(model: str, cfg_dir: Path):
++    cfg_path = cfg_dir / f"{model}.yaml"
++    if cfg_path.exists(): return cfg_path
++    cfg = {
++        "task": "object_detection",
++        "model_name": model,
++        "weight": f"../models/weight/object_detection/{model}.pt",
++        "onnx_path": f"../models/onnx/object_detection/{model}.onnx",
++        "onnx_i8_path": f"../models/quantized_onnx/object_detection/{model}_i8.onnx",
++        "calibration_params": {
++            "calibration_method": "SQNR_ASYM",
++            "calibration_data": "../datasets/coco/val2017",
++            "num_calibration_data": 100,
++        },
++        "conf_thres": 0.025,
++        "iou_thres": 0.7,
++        "input_shape": [1, 3, 640, 640],
++        "anchors": [None],
++        "class_names": COCO_CLASSES,
++    }
++    cfg_dir.mkdir(parents=True, exist_ok=True)
++    with cfg_path.open("w", encoding="utf-8") as f:
++        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
++    log_line(f"[AUTO] Created config: {cfg_path}")
++    return cfg_path
++
++# -----------------------------
++# Suite Runner
++# -----------------------------
++def run_one(model: str, batch_size: int) -> Optional[dict]:
++    base = base_model_name(model)
++    cfg_path = ensure_cfg_yaml(base, CFG_DIR)
++    rc, lines = run_cmd_stream([
++        "warboy-vision","model-performance","--config_file",str(cfg_path),"--batch-size",str(batch_size)
++    ])
++    if rc != 0: 
++        log_line(f"[WARN] model-performance failed (rc={rc}) for {model} bs={batch_size}")
++        return None
++
++    result = extract_result_json(lines)
++    if result is None:
++        log_line(f"[WARN] JSON result not found for {model} bs={batch_size}")
++        return None
++
++    # parse extra metrics
++    conf_thres = iou_thres = sec = mAP = target = None
++    status = None
++    for line in lines:
++        m1 = re.match(r"^([0-9.]+)\s+([0-9.]+)", line.strip())
++        if m1:
++            conf_thres, iou_thres = float(m1.group(1)), float(m1.group(2))
++        m2 = re.search(r"Inference Done in ([0-9.]+) sec", line)
++        if m2:
++            sec = float(m2.group(1))
++        m3 = re.search(r"Accuracy check (success|failed)! -> mAP: ([0-9.]+) \[Target: ([0-9.]+)\]", line)
++        if m3:
++            status = m3.group(1)
++            mAP = float(m3.group(2))
++            target = float(m3.group(3))
++
++    # store parsed + computed
++    result["metrics"] = {
++        "conf_thres": conf_thres,
++        "iou_thres": iou_thres,
++        "sec": sec,
++        "mAP": mAP,
++        "target": target,
++        "status": status,
++    }
++    
++    # NEW: compute per-image wall throughput
++    e2e_wall_imgps = get_e2e_wall_imgps(result)
++    result.setdefault("computed", {})["e2e_wall_per_image"] = e2e_wall_imgps
++
++    thr = result.get("throughput_img_per_s", {})
++    lat = result.get("latency_ms", {})
++    log_line("")
++    log_line(
++        "RESULT "
++        f"{model} bs={batch_size} | "
++        f"e2e_wall_imgps={e2e_wall_imgps} e2e_active={thr.get('e2e_active')} infer_only={thr.get('infer_only')} | "
++        f"lat_pre_avg={(lat.get('pre',{}) or {}).get('avg')} lat_infer_avg={(lat.get('infer',{}) or {}).get('avg')} "
++        f"lat_post_avg={(lat.get('post',{}) or {}).get('avg')} | "
++        f"mAP={mAP} target={target} status={status} | conf={conf_thres} iou={iou_thres} sec={sec}"
++    )
++    log_line("")
++    return result
++
++
++def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int) -> str:
++    def fmt(x): 
++        return "NA" if x is None else f"{x:.3f}"
++    
++    conf_val, iou_val = "NA", "NA"
++    for bs_dict in all_results.values():
++        if batch_size in bs_dict:
++            conf_val, iou_val = get_conf_iou(bs_dict[batch_size])
++            break
++
++    header = f"[batch_size : {batch_size}] : conf ({conf_val}), iou ({iou_val})"
++    table = [
++        "| model | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
++        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
++        "|-------|-----------------------------|--------------------|--------------------|"
++        "----------------|-----------------|----------------|-----|--------|--------|---------|",
++    ]
++
++    for model, by_bs in all_results.items():
++        if batch_size not in by_bs:
++            continue
++        res = by_bs[batch_size]
++        thr = res.get("throughput_img_per_s", {})
++        lat = res.get("latency_ms", {})
++        m = res.get("metrics", {})
++        comp = res.get("computed", {})
++        row = (
++            f"| {model} | {fmt(comp.get('e2e_wall_per_image'))} | "
++            f"{fmt(thr.get('e2e_active'))} | {fmt(thr.get('infer_only'))} | "
++            f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | "
++            f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
++            f"{fmt((lat.get('post',{}) or {}).get('avg'))} | "
++            f"{fmt(m.get('mAP'))} | {fmt(m.get('target'))} | {m.get('status') or 'NA'} | "
++            f"{fmt(m.get('sec'))} |"
++        )
++        table.append(row)
++
++    return "\n".join([header, ""] + table + [""])
++
++
++def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
++    if not by_bs:
++        return f"[model : {model}] (no results)\n"
++    def fmt(x): 
++        return "NA" if x is None else f"{x:.3f}"
++    
++    first_metrics = next(iter(by_bs.values())).get("metrics", {})
++    conf_val = fmt(first_metrics.get("conf_thres"))
++    iou_val = fmt(first_metrics.get("iou_thres"))
++
++    header = f"[model : {model}] : conf ({conf_val}), iou ({iou_val})"
++    table = [
++        "| batch_size | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
++        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
++        "|------------|-----------------------------|--------------------|--------------------|"
++        "----------------|-----------------|----------------|-----|--------|--------|---------|",
++    ]
++    for bs in sorted(by_bs.keys()):
++        res = by_bs[bs]
++        thr = res.get("throughput_img_per_s", {})
++        lat = res.get("latency_ms", {})
++        metrics = res.get("metrics", {})
++        comp = res.get("computed", {})
++        row = (
++            f"| {bs} | {fmt(comp.get('e2e_wall_per_image'))} | "
++            f"{fmt(thr.get('e2e_active'))} | {fmt(thr.get('infer_only'))} | "
++            f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | "
++            f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
++            f"{fmt((lat.get('post',{}) or {}).get('avg'))} | "
++            f"{fmt(metrics.get('mAP'))} | {fmt(metrics.get('target'))} | {metrics.get('status') or 'NA'} | "
++            f"{fmt(metrics.get('sec'))} |"
++        )
++        table.append(row)
++    return "\n".join([header, ""] + table + [""])
++
++def get_conf_iou(from_res: dict) -> tuple[str, str]:
++    """metrics 블록에서 conf/iou 문자열 반환"""
++    def fmt(x): return "NA" if x is None else f"{x:.3f}"
++    m = from_res.get("metrics", {}) if from_res else {}
++    return fmt(m.get("conf_thres")), fmt(m.get("iou_thres"))
++
++def extract_metric_value(res: dict, metric: str):
++    """metric 이름별 값 추출"""
++    thr, lat, m, comp = (
++        res.get("throughput_img_per_s", {}),
++        res.get("latency_ms", {}),
++        res.get("metrics", {}),
++        res.get("computed", {}),
++    )
++    if metric == "e2e_wall_per_image":
++        return comp.get("e2e_wall_per_image")
++    elif metric == "e2e_active":
++        return thr.get("e2e_active")
++    elif metric == "infer_only":
++        return thr.get("infer_only")
++    elif metric == "lat_pre":
++        return (lat.get("pre", {}) or {}).get("avg")
++    elif metric == "lat_infer":
++        return (lat.get("infer", {}) or {}).get("avg")
++    elif metric == "lat_post":
++        return (lat.get("post", {}) or {}).get("avg")
++    elif metric == "mAP":
++        return m.get("mAP")
++    elif metric == "Target":
++        return m.get("target")
++    elif metric == "Status":
++        return m.get("status")
++    elif metric == "conf":
++        return m.get("conf_thres")
++    elif metric == "iou":
++        return m.get("iou_thres")
++    elif metric == "sec":
++        return m.get("sec")
++    return None
++
++def summarize_transposed_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int) -> str:
++    """
++    Transposed summary: 행(metric), 열(models)
++    """
++    def fmt(x): return "NA" if x is None else f"{x:.3f}"
++    models = list(all_results.keys())
++
++    conf_val, iou_val = "NA", "NA"
++    for bs_dict in all_results.values():
++        if batch_size in bs_dict:
++            conf_val, iou_val = get_conf_iou(bs_dict[batch_size])
++            break
++
++    metrics = [
++        "e2e_wall_per_image", "e2e_active", "infer_only",
++        "lat_pre", "lat_infer", "lat_post",
++        "mAP", "Target", "Status", "sec"
++    ]
++
++    rows = []
++    for metric in metrics:
++        row = [metric]
++        for model in models:
++            res = all_results[model].get(batch_size)
++            if not res:
++                row.append("NA")
++                continue
++            val = extract_metric_value(res, metric)
++            row.append(fmt(val) if metric != "Status" else (val or "NA"))
++        rows.append("| " + " | ".join(row) + " |")
++
++    header = ["models"] + models
++    table = [
++        f"[transposed summary: batch_size={batch_size}, conf ({conf_val}), iou ({iou_val})]",
++        "",
++        "| " + " | ".join(header) + " |",
++        "| " + " | ".join(["---"] * len(header)) + " |",
++    ] + rows
++    return "\n".join(table) + "\n"
++
++def summarize_transposed_by_model(model: str, by_bs: Dict[int, dict]) -> str:
++    """
++    Transposed summary: 행(metric), 열(batch sizes)
++    """
++    def fmt(x): return "NA" if x is None else f"{x:.3f}"
++    batch_sizes = sorted(by_bs.keys())
++
++    # conf/iou는 첫 배치 결과에서 가져오기
++    first_res = next(iter(by_bs.values()))
++    conf_val, iou_val = get_conf_iou(first_res)
++
++    metrics = ["e2e_wall_per_image", "e2e_active", "infer_only",
++               "lat_pre", "lat_infer", "lat_post",
++               "mAP", "Target", "Status", "sec"]
++
++    rows = []
++    for metric in metrics:
++        row = [metric]
++        for bs in batch_sizes:
++            res = by_bs[bs]
++            val = extract_metric_value(res, metric)
++            row.append(fmt(val) if metric != "Status" else (val or "NA"))
++        rows.append("| " + " | ".join(row) + " |")
++
++    header = ["batch_size"] + [str(bs) for bs in batch_sizes]
++    table = [
++        f"[transposed summary: model={model}, conf ({conf_val}), iou ({iou_val})]",
++        "",
++        "| " + " | ".join(header) + " |",
++        "| " + " | ".join(["---"] * len(header)) + " |",
++    ] + rows
++    return "\n".join(table) + "\n"
++
++# -----------------------------
++# Main
++# -----------------------------
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--detach", action="store_true")
++    args = parser.parse_args()
++    log_line("="*80)
++    log_line(f"===== Run started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====")
++    log_line(f"Full log file: {FULL_LOG_FILE}")
++    log_line(f"Result log file: {RESULT_LOG_FILE}")
++    log_line("="*80)
++
++    models = discover_models_from_enf(ENF_DIR)
++    log_line(f"Models to process: {models}")
++    all_results: Dict[str, Dict[int, dict]] = {}
++
++    for model in models:
++        log_line("="*80)
++        log_line(f"PROCESS MODEL: {model}")
++        batches = available_batches_for_model(model)
++        if not batches:
++            log_line(f"[WARN] No ENF found for {model}")
++            continue
++
++        log_line(f"Available batches: {batches}")
++        model_results: Dict[int, dict] = {}
++
++        for bs in batches:
++            res = run_one(model, bs)
++            if res:
++                model_results[bs] = res
++
++        all_results[model] = model_results
++
++        # 모델별 요약 저장
++        if model_results:
++            summary = summarize_by_model(model, model_results)
++            log_line("\n" + summary)  # full 로그에 기록
++            with RESULT_LOG_FILE.open("a", encoding="utf-8") as rf:
++                rf.write(summary + "\n\n")  # result 로그에 따로 저장
++
++            summary_t = summarize_transposed_by_model(model, model_results)
++            log_line("\n" + summary_t)
++            with RESULT_LOG_FILE.open("a", encoding="utf-8") as rf:
++                rf.write(summary_t + "\n\n")
++
++    # 배치 사이즈별 요약 (full 로그에만 기록)
++    batch_sizes_present = sorted({bs for m in all_results.values() for bs in m.keys()})
++    for bs in batch_sizes_present:
++        summary = summarize_by_batch(all_results, bs)
++        log_line("\n" + summary)
++        with RESULT_LOG_FILE.open("a", encoding="utf-8") as rf:
++            rf.write(summary + "\n\n")
++
++        summary_t = summarize_transposed_by_batch(all_results, bs)
++        log_line("\n" + summary_t)
++        with RESULT_LOG_FILE.open("a", encoding="utf-8") as rf:
++            rf.write(summary_t + "\n\n")
++
++    log_line("All done.")
++
++
++if __name__=="__main__":
++    try: main()
++    except KeyboardInterrupt: log_line("Interrupted by user."); raise
+diff --git a/src/cli/performance_test/run_test_scenarios.py b/src/cli/performance_test/run_test_scenarios.py
+index 6e3f296..4c318c3 100644
+--- a/src/cli/performance_test/run_test_scenarios.py
++++ b/src/cli/performance_test/run_test_scenarios.py
+@@ -15,17 +15,25 @@ from ...warboy import get_model_params_from_cfg
+     required=True,
+     help="The path to the model configuration file.",
+ )
+-def run_e2e_test(config_file: str):
++@click.option(
++    "--batch-size",
++    type=int,
++    default=1,
++    show_default=True,
++    help="Override batch size for inference (default: 1).",
++)
++def run_e2e_test(config_file: str, batch_size: int):
+     ANNOTATION_DIR = (
+-        "datasets/coco/annotations"  # CHECK you may change this to your own path
++        "../datasets/coco/annotations"  # CHECK you may change this to your own path
+     )
+ 
+-    IMAGE_DIR = "datasets/coco/val2017"  # CHECK you may change this to your own path
++    IMAGE_DIR = "../datasets/coco/val2017"  # CHECK you may change this to your own path
+ 
+     param = get_model_params_from_cfg(config_file)
+ 
+     if param["task"] == "object_detection":
+-        func = object_det.test_warboy_yolo_accuracy_det
++        #func = object_det.test_warboy_yolo_accuracy_det
++        func = object_det.test_warboy_yolo_performance_det
+         annotation = f"{ANNOTATION_DIR}/instances_val2017.json"
+         image_dir = IMAGE_DIR
+ 
+@@ -44,7 +52,7 @@ def run_e2e_test(config_file: str):
+             "Invalid task type. Choose from 'object_detection', 'pose_estimation', or 'instance_segmentation'."
+         )
+ 
+-    func(config_file, image_dir, annotation)
++    func(config_file, image_dir, annotation, batch_size=batch_size)
+ 
+ 
+ @click.command(
+diff --git a/src/test_scenarios/e2e/object_det.py b/src/test_scenarios/e2e/object_det.py
+index daedb16..b8d2d59 100644
+--- a/src/test_scenarios/e2e/object_det.py
++++ b/src/test_scenarios/e2e/object_det.py
+@@ -2,11 +2,21 @@ import os
+ from concurrent.futures import ThreadPoolExecutor
+ from pathlib import Path
+ 
++import cv2
++import json
++from typing import List
++import asyncio
++import time
++from statistics import mean, median
++import numpy as np
++from multiprocessing import Manager
++
+ from pycocotools.cocoeval import COCOeval
+ 
+ from ...warboy import get_model_params_from_cfg
+ from ...warboy.utils.process_pipeline import Engine, Image, ImageList, PipeLine
+ from ...warboy.yolo.preprocess import YoloPreProcessor
++
+ from ..utils import (
+     YOLO_CATEGORY_TO_COCO_CATEGORY,
+     MSCOCODataLoader,
+@@ -14,46 +24,49 @@ from ..utils import (
+     xyxy2xywh,
+ )
+ 
++# ------------------------------------------------------
++# Config
++# ------------------------------------------------------
++ENF_DIR = Path("../models/enf")
++QUANTIZED_ONNX_DIR = "quantized_onnx"
++
+ TARGET_ACCURACY = {
+-    "yolov5nu": 0.343,
+-    "yolov5su": 0.430,
+-    "yolov5mu": 0.490,
+-    "yolov5lu": 0.522,
+-    "yolov5xu": 0.532,
+-    "yolov5n": 0.280,
+-    "yolov5s": 0.374,
+-    "yolov5m": 0.454,
+-    "yolov5l": 0.490,
+-    "yolov5x": 0.507,
+-    "yolov7": 0.514,
+-    "yolov7x": 0.531,
+-    "yolov7-w6": 0.549,
+-    "yolov7-e6": 0.560,
+-    "yolov7-d6": 0.566,
+-    "yolov7-e6e": 0.568,
+-    "yolov8n": 0.373,
+-    "yolov8s": 0.449,
+-    "yolov8m": 0.502,
+-    "yolov8l": 0.529,
+-    "yolov8x": 0.539,
+-    "yolov9t": 0.383,
+-    "yolov9s": 0.468,
+-    "yolov9m": 0.514,
+-    "yolov9c": 0.530,
+-    "yolov9e": 0.556,
+-    "yolov5n6": 0.360,
+-    "yolov5n6u": 0.421,
+-    "yolov5s6": 0.448,
+-    "yolov5s6u": 0.486,
+-    "yolov5m6": 0.513,
+-    "yolov5m6u": 0.536,
+-    "yolov5l6": 0.537,
+-    "yolov5l6u": 0.557,
+-    "yolov5x6": 0.550,
++    "yolov5nu": 0.343, "yolov5su": 0.430, "yolov5mu": 0.490,
++    "yolov5lu": 0.522, "yolov5xu": 0.532, "yolov5n": 0.280,
++    "yolov5s": 0.374, "yolov5m": 0.454, "yolov5l": 0.490,
++    "yolov5x": 0.507, "yolov7": 0.514, "yolov7x": 0.531,
++    "yolov7-w6": 0.549, "yolov7-e6": 0.560, "yolov7-d6": 0.566,
++    "yolov7-e6e": 0.568, "yolov8n": 0.373, "yolov8s": 0.449,
++    "yolov8m": 0.502, "yolov8l": 0.529, "yolov8x": 0.539,
++    "yolov9t": 0.383, "yolov9s": 0.468, "yolov9m": 0.514,
++    "yolov9c": 0.530, "yolov9e": 0.556,
++    "yolov5n6": 0.360, "yolov5n6u": 0.421, "yolov5s6": 0.448,
++    "yolov5s6u": 0.486, "yolov5m6": 0.513, "yolov5m6u": 0.536,
++    "yolov5l6": 0.537, "yolov5l6u": 0.557, "yolov5x6": 0.550,
+     "yolov5x6u": 0.568,
+ }
+ 
+ 
++# ------------------------------------------------------
++# Helpers
++# ------------------------------------------------------
++def quantiles(arr: List[float]):
++    if not arr:
++        return (None, None, None, None)
++    arr_sorted = sorted(arr)
++    p50 = median(arr_sorted)
++
++    def pick(p):
++        if len(arr_sorted) < 100 and p == 0.99:
++            return None
++        if len(arr_sorted) < 10 and p == 0.90:
++            return None
++        idx = max(0, min(len(arr_sorted)-1, int(p * len(arr_sorted)) - 1))
++        return arr_sorted[idx]
++    
++    return (mean(arr_sorted), p50, pick(0.90), pick(0.99))
++
++
+ def _process_output(img_path, annotation, outputs_dict):
+     results = []
+     key = str(img_path)
+@@ -150,3 +163,97 @@ def test_warboy_yolo_accuracy_det(cfg: str, image_dir: str, annotation_file: str
+         print(
+             f"{param['model_name']} Accuracy check failed! -> mAP: {coco_eval.stats[0]} [Target: {TARGET_ACCURACY[param['model_name']] * 0.9}]"
+         )
++
++
++def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotation_file: str,
++                                     use_enf=True, batch_size: int=1):
++    """성능/정확도 테스트: latency, throughput, mAP"""
++
++    param = get_model_params_from_cfg(config_file)
++    model_name = param["model_name"]
++    input_shape = param["input_shape"] 
++
++    # YAML 기반 conf/iou
++    engin_configs = set_test_engin_configs(param, 1)
++
++    # ENF 경로 확인
++    if use_enf:
++        enf_file = f"{model_name}_{batch_size}b.enf" if batch_size > 1 else f"{model_name}.enf"
++        enf_path = ENF_DIR / param["task"] / enf_file
++        if enf_path.is_file(): model_path = str(enf_path)
++        else: raise FileNotFoundError(f"ENF file not found: {enf_path}")
++    else:
++        model_path = param.get("onnx_i8_path") or os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"])
++
++    # 이미지 준비
++    image_names = os.listdir(image_dir)
++    images = [Image(image_info=os.path.join(image_dir, n)) for n in image_names]
++
++    preprocessor = YoloPreProcessor(new_shape=input_shape[2:])
++    data_loader = MSCOCODataLoader(Path(image_dir), Path(annotation_file), preprocessor, input_shape)
++
++    # shared timings
++    manager = Manager()
++    TIMINGS = manager.dict()
++
++    # Pipeline
++    task = PipeLine(run_fast_api=False, run_e2e_test=True, num_channels=len(images), timings=TIMINGS)
++    for idx, engin in enumerate(engin_configs):
++        engin["model"] = model_path
++        #print("[Engine Config]", json.dumps(engin, indent=2, default=str)) 
++        task.add(Engine(**engin, batch_size=batch_size), postprocess_as_img=False)
++        task.add(ImageList([image for image in images[idx::len(engin_configs)]]),
++                 name=engin["name"], postprocess_as_img=False)
++
++    wall_start = time.time()
++    task.run()
++    wall_elapsed = time.time() - wall_start
++
++    print(f"Inference Done in {wall_elapsed:.2f} sec")
++
++    # latency 요약
++    pre_list, infer_list, post_list, e2e_active_list, e2e_wall_list = [], [], [], [], []
++    for timings in TIMINGS.values():
++        if "pre" in timings: pre_list.append(timings["pre"])
++        if "infer" in timings: infer_list.append(timings["infer"])
++        if "post" in timings: post_list.append(timings["post"])
++        if "e2e_active" in timings: e2e_active_list.append(timings["e2e_active"])
++        if "e2e" in timings: e2e_wall_list.append(timings["e2e"])
++
++    def summarize(xs): 
++        return {"avg": float(np.mean(xs)), "p50": float(np.median(xs))} if xs else {}
++
++    summary = {
++        "model": model_name,  # 파일 경로 대신 모델명만
++        "cfg": os.path.basename(config_file),
++        "images": len(pre_list),
++        "throughput_img_per_s": {
++            "e2e_active": 1000.0 / summarize(e2e_active_list).get("avg", np.nan),
++            "infer_only": 1000.0 / summarize(infer_list).get("avg", np.nan),
++            "e2e_wall_per_image": 1000.0 / summarize(e2e_wall_list).get("avg", np.nan),
++        },
++        "latency_ms": {
++            "pre": summarize(pre_list),
++            "infer": summarize(infer_list),
++            "post": summarize(post_list),
++            "e2e_active": summarize(e2e_active_list),
++            "e2e_wall": summarize(e2e_wall_list),
++        },
++        "dataset_img_per_s": {
++            "throughput_wall": len(pre_list) / wall_elapsed if wall_elapsed > 0 else None
++        }
++    }
++    print(json.dumps(summary, indent=2))
++
++    # COCO mAP
++    results = _process_outputs(task.outputs, data_loader)
++    coco_result = data_loader.coco.loadRes(results)
++    coco_eval = COCOeval(data_loader.coco, coco_result, "bbox")
++    coco_eval.evaluate(); coco_eval.accumulate(); coco_eval.summarize()
++
++    mAP = coco_eval.stats[0]
++    target = TARGET_ACCURACY.get(model_name, 0.3) * 0.9
++    if mAP >= target:
++        print(f"{model_name} Accuracy check success! -> mAP: {mAP} [Target: {target}]")
++    else:
++        print(f"{model_name} Accuracy check failed! -> mAP: {mAP} [Target: {target}]")
+diff --git a/src/test_scenarios/utils.py b/src/test_scenarios/utils.py
+index 93fc0a2..94c15fb 100644
+--- a/src/test_scenarios/utils.py
++++ b/src/test_scenarios/utils.py
+@@ -142,8 +142,11 @@ def set_test_engin_configs(param, num_device):
+             "model_type": param["model_name"],
+             "input_shape": param["input_shape"][2:],
+             "class_names": param["class_names"],
+-            "conf_thres": CONF_THRES,
+-            "iou_thres": IOU_THRES,
++            #"conf_thres": CONF_THRES,
++            #"iou_thres": IOU_THRES,
++            ## -- jgcha
++            "conf_thres": float(param.get("conf_thres", CONF_THRES)),
++            "iou_thres": float(param.get("iou_thres", IOU_THRES)),
+             "use_tracking": False,
+         }
+         engin_configs.append(engin_config)
+diff --git a/src/warboy/runtime/warboy_runtime.py b/src/warboy/runtime/warboy_runtime.py
+index 7641e14..9adff36 100644
+--- a/src/warboy/runtime/warboy_runtime.py
++++ b/src/warboy/runtime/warboy_runtime.py
+@@ -8,6 +8,7 @@ from furiosa.server.model import FuriosaRTModel, FuriosaRTModelConfig
+ 
+ from ..utils.queue import PipeLineQueue, QueueClosedError, StopSig
+ 
++import numpy as np
+ 
+ class WarboyApplication:
+     """
+@@ -28,13 +29,47 @@ class WarboyApplication:
+         device: str,
+         stream_mux_list: List[PipeLineQueue],
+         output_mux_list: List[PipeLineQueue],
++        batch_size: int = 1,
++        timings = None,
+     ):
+-        self.config = {"model": model, "worker_num": worker_num, "npu_device": device}
+-        self.model = FuriosaRTModel(
+-            FuriosaRTModelConfig(name="YOLO", batch_size=1, **self.config)
+-        )
++        #self.config = {"model": model, "worker_num": worker_num, "npu_device": device}
++        #self.model = FuriosaRTModel(
++        #    FuriosaRTModelConfig(name="YOLO", batch_size=1, **self.config)
++        #)
++        
++        if model.endswith(".enf"):
++            print(f"[WarboyApplication] Loading precompiled ENF: {model}")
++            self.config = {
++                "model": model,
++                "worker_num": worker_num,
++                "npu_device": device,
++            }
++            self.model = FuriosaRTModel(
++                FuriosaRTModelConfig(
++                    name="YOLO",                  
++                    **self.config
++                )
++            )
++        else:
++            print(f"[WarboyApplication] Loading ONNX (will compile): {model}")
++            self.config = {
++                "model": model,
++                "worker_num": worker_num,
++                "npu_device": device,
++            }
++            self.model = FuriosaRTModel(
++                FuriosaRTModelConfig(
++                    name="YOLO",
++                    batch_size=batch_size,
++                    **self.config
++                )
++            )        
++        
++        self.batch_size = batch_size
+         self.stream_mux_list = stream_mux_list
+         self.output_mux_list = output_mux_list
++
++        self.timings = timings
+         print("WarboyApplication - init")
+ 
+     def run(self):
+@@ -55,20 +90,148 @@ class WarboyApplication:
+     async def inference(
+         self, video_channel: int, stream_mux: PipeLineQueue, output_mux: PipeLineQueue
+     ):
++        # ✅ batch_size == 1 → 절대 변경하지 않음
++        if self.batch_size == 1:
++            while True:
++                try:
++                    input_, img_idx = stream_mux.get()
++                except QueueClosedError:
++                    break
++
++                t2 = time.perf_counter()
++                output = await self.model.predict(input_)  # 원래대로
++
++                if img_idx < 2:  # 처음 몇 장만
++                    print("[DEBUG bs=1]", type(output), getattr(output, "shape", None))
++                    if isinstance(output, (list, tuple)):
++                        for j, head in enumerate(output):
++                            print(f"  head{j}:", type(head), getattr(head, "shape", None))
++
++                t3 = time.perf_counter()
++                infer_ms = (t3 - t2) * 1000.0
++
++                if self.timings is not None:
++                    d = dict(self.timings.get(img_idx, {}))
++                    d["infer"] = infer_ms
++                    d["t2"] = t2
++                    self.timings[img_idx] = d
++                    if img_idx < 5:
++                        print(f"[Runtime] {img_idx} infer={infer_ms:.3f} ms")
++
++                output_mux.put(output)  # 원래대로
++
++            output_mux.put(StopSig)
++            return
++
++        # ✅ batch_size > 1 → 배치 모드
++        batch_inputs, batch_indices = [], []
++
++        def _norm_head_per_image(head: np.ndarray, i: int):
++            """
++            배치 ENF가 평탄화해서 내보내는 head를
++            postprocessor가 기대하는 (1, C, H, W)로 되돌린다.
++            """
++            if not isinstance(head, np.ndarray):
++                return head
++
++            arr = head
++
++            # 1) 배치축이 있는 경우 per-image로 슬라이스
++            if arr.ndim == 4 and arr.shape[0] > i:
++                # (B, C, H, W) → (1, C, H, W)
++                return arr[i:i+1]
++            if arr.ndim == 3 and arr.shape[0] == self.batch_size and arr.shape[0] > i:
++                # (B, C*H, W) 같은 형태 → i 슬라이스 후 아래에서 복원
++                arr = arr[i]
++
++            # 2) per-image 상태에서 모양 복원
++            if arr.ndim == 3:
++                # (C, H, W) → (1, C, H, W)
++                return arr[None, ...]
++            if arr.ndim == 2:
++                # (C*H, W) → (1, C, H, W), 여기서 H=W 가정
++                W = arr.shape[1]
++                H = W
++                C = arr.shape[0] // H if H > 0 else 0
++                if C * H == arr.shape[0] and C > 0:
++                    return arr.reshape(1, C, H, W)
++                return arr
++
++            return arr
++
++        def _per_image(outputs, i):
++            if isinstance(outputs, (list, tuple)):
++                fixed = [ _norm_head_per_image(h, i) for h in outputs ]
++                return type(outputs)(fixed)
++            if isinstance(outputs, np.ndarray):
++                return _norm_head_per_image(outputs, i)
++            return outputs
++
++        def _emit(outputs, infer_ms, t2, B_effective=None):
++            """
++            B_effective: 추론 시간 분배에 사용할 배치 크기
++            - 정규 배치: len(batch_indices) == self.batch_size
++            - 잔여 패딩 배치: self.batch_size (HW 관점으로 분배)
++            """
++            B = B_effective if B_effective is not None else len(batch_indices)
++            for i, idx in enumerate(batch_indices):
++                # 🔍 디버깅: bs>1 구조 확인
++                if idx < 2:
++                    def _peek(x):
++                        if isinstance(x, (list, tuple)):
++                            return [ (getattr(a, 'shape', None)) for a in x ]
++                        return getattr(x, 'shape', None)
++                    print(f"[DEBUG bs>1] out_i structure: {_peek(out_i)}")
++
++                out_i = _per_image(outputs, i)
++                if self.timings is not None:
++                    d = dict(self.timings.get(idx, {}))
++                    d["infer"] = infer_ms / B
++                    d["t2"] = t2
++                    self.timings[idx] = d
++                output_mux.put(out_i)
+ 
+         while True:
+-            t1 = time.time()
+             try:
+-                input_, _ = stream_mux.get()
++                input_, img_idx = stream_mux.get()
++                batch_inputs.append(input_)
++                batch_indices.append(img_idx)
++
++                if len(batch_inputs) < self.batch_size:
++                    continue
++
+             except QueueClosedError:
+-                # print(f"Video-Channel - {video_channel} End!")
++                if batch_inputs:
++                    actual = len(batch_inputs)
++                    if actual < self.batch_size:
++                        pad_needed = self.batch_size - actual
++                        batch_inputs_padded = batch_inputs + [batch_inputs[-1]] * pad_needed
++                    else:
++                        batch_inputs_padded = batch_inputs
++
++                    batched_input = np.concatenate(batch_inputs_padded, axis=0)  # (B,C,H,W)
++                    t2 = time.perf_counter()
++                    outputs = await self.model.predict(batched_input)
++                    t3 = time.perf_counter()
++                    infer_ms = (t3 - t2) * 1000.0
++
++                    # 패딩 실행 → 분배는 B=self.batch_size 기준
++                    _emit(outputs, infer_ms, t2, B_effective=self.batch_size)
+                 break
+-            output = await self.model.predict(input_)
+-            output_mux.put(output)
++
++            # 정규 배치 실행
++            batch_input = np.concatenate(batch_inputs, axis=0)  # (B,C,H,W)
++            t2 = time.perf_counter()
++            outputs = await self.model.predict(batch_input)
++            t3 = time.perf_counter()
++            infer_ms = (t3 - t2) * 1000.0
++            
++            _emit(outputs, infer_ms, t2)
++            batch_inputs, batch_indices = [], []
+ 
+         output_mux.put(StopSig)
+         return
+-
++    
+     async def load(self):
+         await self.model.load()
+ 
+diff --git a/src/warboy/utils/image_decoder.py b/src/warboy/utils/image_decoder.py
+index e48c138..d730640 100644
+--- a/src/warboy/utils/image_decoder.py
++++ b/src/warboy/utils/image_decoder.py
+@@ -5,6 +5,7 @@ import cv2
+ from ..yolo.preprocess import YoloPreProcessor
+ from .queue import PipeLineQueue, QueueClosedError, StopSig
+ 
++import time
+ 
+ class ImageListDecoder:
+     def __init__(
+@@ -13,6 +14,7 @@ class ImageListDecoder:
+         stream_mux: PipeLineQueue,
+         frame_mux: PipeLineQueue,
+         preprocess_function: Callable = YoloPreProcessor(),
++        timings = None,
+     ):
+         self.image_paths = PipeLineQueue()
+         for image in image_list:
+@@ -22,6 +24,7 @@ class ImageListDecoder:
+         self.preprocessor = preprocess_function
+         self.stream_mux = stream_mux
+         self.frame_mux = frame_mux
++        self.timings = timings
+ 
+     def run(self):
+         img_idx = 0
+@@ -29,7 +32,21 @@ class ImageListDecoder:
+             try:
+                 image_path = self.image_paths.get()
+                 img = cv2.imread(image_path)
++                
++                t0 = time.perf_counter()
+                 input_, context = self.preprocessor(img)
++                t1 = time.perf_counter()
++                pre_ms = (t1 - t0) * 1000.0
++
++                if self.timings is not None:
++                    d = dict(self.timings.get(img_idx, {}))  # 기존 값 복사
++                    d["pre"] = pre_ms
++                    d["t0"] = t0
++                    self.timings[img_idx] = d               # 새 dict로 교체
++
++                    if img_idx < 5:
++                        print(f"[Decoder] {img_idx} pre={pre_ms:.3f} ms")
++                    
+                 self.stream_mux.put((input_, img_idx))
+                 self.frame_mux.put((img, context, img_idx))
+                 img_idx += 1
+diff --git a/src/warboy/utils/image_encoder.py b/src/warboy/utils/image_encoder.py
+index 591afbe..4c4e604 100644
+--- a/src/warboy/utils/image_encoder.py
++++ b/src/warboy/utils/image_encoder.py
+@@ -3,7 +3,7 @@ from typing import Callable
+ 
+ from .queue import PipeLineQueue, QueueClosedError, StopSig
+ 
+-
++import numpy as np
+ class ImageEncoder:
+     def __init__(
+         self,
+@@ -53,18 +53,49 @@ class PredictionEncoder:
+         output_mux: PipeLineQueue,
+         result_mux: PipeLineQueue,
+         postprocess_function: Callable,
++        timings = None,
+     ):
+         self.frame_mux = frame_mux
+         self.output_mux = output_mux
+         self.result_mux = result_mux
+         self.postprocessor = postprocess_function
++        self.timings = timings
+ 
+     def run(self):
+         while True:
+             try:
+                 frame, context, img_idx = self.frame_mux.get()
+                 output = self.output_mux.get()
++
++                t4 = time.perf_counter()
+                 preds = self.postprocessor(output, context, frame.shape[:2])
++                t5 = time.perf_counter()
++                post_ms = (t5 - t4) * 1000.0
++
++                if self.timings is not None:
++                    d = dict(self.timings.get(img_idx, {}))
++                    d["post"] = post_ms
++                    pre_ms = d.get("pre", 0.0)
++                    infer_ms = d.get("infer", 0.0)
++                    e2e_active = pre_ms + infer_ms + post_ms
++                    d["e2e_active"] = e2e_active
++
++                    # e2e_wall
++                    t0 = d.get("t0")
++                    if t0 is not None:
++                        e2e_wall_val = (time.perf_counter() - t0) * 1000.0
++                        d["e2e"] = e2e_wall_val
++                    else:
++                        e2e_wall_val = None
++
++                    self.timings[img_idx] = d
++
++                    if img_idx < 5:
++                        e2e_wall_str = f"{e2e_wall_val:.3f} ms" if e2e_wall_val else "NA"
++                        print(f"[Encoder] {img_idx} post={post_ms:.3f} ms "
++                            f"e2e_active={e2e_active:.3f} ms "
++                            f"e2e_wall={e2e_wall_str}")
++                    
+                 if not self.result_mux is None:
+                     self.result_mux.put((preds, 0.0, img_idx))
+             except QueueClosedError:
+diff --git a/src/warboy/utils/process_pipeline.py b/src/warboy/utils/process_pipeline.py
+index 99d1021..99c8f7b 100644
+--- a/src/warboy/utils/process_pipeline.py
++++ b/src/warboy/utils/process_pipeline.py
+@@ -32,6 +32,7 @@ class Engine:
+     input_shape: Tuple[int, int] = (640, 640)
+     anchors = [None]
+     use_tracking: bool = True
++    batch_size: int = 1
+ 
+     def _get_runtime_info(self):
+         return
+@@ -63,6 +64,7 @@ class PipeLine:
+         run_fast_api: bool = True,
+         run_e2e_test: bool = False,
+         make_image_output: bool = False,
++        timings = None,
+     ):
+         self.run_fast_api = run_fast_api
+         self.run_e2e_test = run_e2e_test
+@@ -88,13 +90,21 @@ class PipeLine:
+ 
+         self.results = []
+ 
++        self.timings = timings if timings is not None else {}
++
+     def add(self, obj, name: str = "", postprocess_as_img=True):
+         if isinstance(obj, Engine):
+             self.runtime_info[obj.name] = {
+                 "model": obj.model,
+                 "worker_num": obj.worker_num,
+                 "device": obj.device,
++                "batch_size": obj.batch_size,
++                "conf_thres": obj.conf_thres,
++                "iou_thres": obj.iou_thres,
+             }
++            import json
++            print(f"[Pipeline.add] Engine registered: {json.dumps(self.runtime_info[obj.name], indent=2)}")
++
+             if "yolo" in obj.model:
+                 self.preprocess_functions[obj.name] = YoloPreProcessor(
+                     new_shape=obj.input_shape, tensor_type="uint8"
+@@ -183,6 +193,7 @@ class PipeLine:
+                     stream_mux=new_stream_mux,
+                     frame_mux=new_frame_mux,
+                     preprocess_function=self.preprocess_functions[name],
++                    timings=self.timings,
+                 )
+             )
+             # Postprocess (draw bbox for object detection)
+@@ -193,6 +204,7 @@ class PipeLine:
+                         output_mux=new_output_mux,
+                         result_mux=new_result_mux,
+                         postprocess_function=self.postprocess_functions[name],
++                        timings=self.timings,
+                     )
+                 )
+             else:
+@@ -202,6 +214,7 @@ class PipeLine:
+                         output_mux=new_output_mux,
+                         result_mux=new_result_mux,
+                         postprocess_function=self.postprocess_functions[name],
++                        timings=self.timings,
+                     )
+                 )
+         else:
+@@ -216,6 +229,8 @@ class PipeLine:
+                     device=runtime_info["device"],
+                     stream_mux_list=self.stream_mux_list[name],
+                     output_mux_list=self.output_mux_list[name],
++                    batch_size=runtime_info["batch_size"],
++                    timings=self.timings,
+                 )
+                 for name, runtime_info in self.runtime_info.items()
+             ]
+diff --git a/src/warboy/warboy_api.py b/src/warboy/warboy_api.py
+index 8862790..1cc05bb 100644
+--- a/src/warboy/warboy_api.py
++++ b/src/warboy/warboy_api.py
+@@ -14,6 +14,8 @@ def set_demo_engin_config(param, idx):
+         "model_type": param["model_name"],
+         "input_shape": param["input_shape"],
+         "class_names": param["class_name"],
++        "iou_thres": param["model_param"].get("iou_thres", 0.7),
++        "conf_thres": param["model_param"].get("conf_thres", 0.25),
+     }
+     return engin_config
+ 
+diff --git a/tests/e2e/test_object_det.py b/tests/e2e/test_object_det.py
+index 9488ae1..7bd2e3a 100644
+--- a/tests/e2e/test_object_det.py
++++ b/tests/e2e/test_object_det.py
+@@ -20,6 +20,12 @@ from tests.utils import (
+ )
+ 
+ CONFIG_PATH = "./tests/test_config/object_detection"
++##-- jgcha
++ENF_DIR = Path("../models/enf")  # models/enf/object_detection/<model_name>.enf
++##-- True  -> ENF 파일을 직접 로드 (컴파일 없이 즉시 추론)
++##-- False -> 양자화 ONNX(quantized_onnx)를 로드 (최초 1회 컴파일 후 캐시 재사용)
++USE_ENF = True
++
+ YAML_PATH = [
+     os.path.join(CONFIG_PATH, model_name + ".yaml")
+     for model_name in TEST_MODEL_LIST["object_detection"]
+@@ -27,15 +33,34 @@ YAML_PATH = [
+ 
+ PARAMS = [get_model_params_from_cfg(yaml) for yaml in YAML_PATH]
+ 
+-PARAMETERS = [
+-    (
+-        param["model_name"],
+-        os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"]),
++PARAMETERS = []
++for param in PARAMS:
++    task = param["task"]                    # 예: "object_detection"
++    model_name = param["model_name"]        # 예: "yolov9t"
++    if USE_ENF:
++        # ENF 경로 직접 사용
++        model_path = str(ENF_DIR / task / f"{model_name}.enf")
++    else:
++        # 양자화 ONNX 경로 사용 (최초 실행 시 컴파일 후 캐시 재사용)
++        model_path = os.path.join(QUANTIZED_ONNX_DIR, task, param["onnx_i8_path"])
++
++    PARAMETERS.append((
++        model_name,
++        model_path,
+         param["input_shape"],
+         param["anchors"],
+-    )
+-    for param in PARAMS
+-]
++        task,
++    ))
++
++# PARAMETERS = [
++#     (
++#         param["model_name"],
++#         os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"]),
++#         param["input_shape"],
++#         param["anchors"],
++#     )
++#     for param in PARAMS
++# ]
+ 
+ TARGET_ACCURACY = {
+     "yolov5nu": 0.343,
+@@ -133,6 +158,21 @@ async def warboy_inference(model, data_loader, preprocessor, postprocessor):
+ def test_warboy_yolo_accuracy_det(
+     model_name: str, model: str, input_shape: List[int], anchors
+ ):
++
++    ##-- ENF 사용 모드일 때는 ENF 파일 존재 검사
++    if USE_ENF:
++        if not Path(model).is_file():
++            ##-- 안내: ENF 생성 방법 힌트 제공
++            qonnx = os.path.join(QUANTIZED_ONNX_DIR, task, f"{model_name}_i8.onnx")
++            enf_target = ENF_DIR / task / f"{model_name}.enf"
++            raise FileNotFoundError(
++                f"[ENF not found]\n"
++                f"  - Expected: {model}\n\n"
++                f"To create it once, run:\n"
++                f"  furiosa-compiler {qonnx} -o {enf_target}\n"
++                f"(Then rerun the test; it will load ENF without compilation.)"
++            )
++
+     model_cfg = {"conf_thres": CONF_THRES, "iou_thres": IOU_THRES, "anchors": anchors}
+ 
+     preprocessor = YoloPreProcessor(new_shape=input_shape[2:])
+@@ -141,9 +181,9 @@ def test_warboy_yolo_accuracy_det(
+     ).postprocess_func
+ 
+     data_loader = MSCOCODataLoader(
+-        Path("datasets/coco/val2017"),  # CHECK you may change this to your own path
++        Path("../datasets/coco/val2017"),  # CHECK you may change this to your own path
+         Path(
+-            "datasets/coco/annotations/instances_val2017.json"
++            "../datasets/coco/annotations/instances_val2017.json"
+         ),  # CHECK you may change this to your own path
+         preprocessor,
+         input_shape,
+diff --git a/tutorials/cfg/yolov8l.yaml b/tutorials/cfg/yolov8l.yaml
+new file mode 100644
+index 0000000..33c8a93
+--- /dev/null
++++ b/tutorials/cfg/yolov8l.yaml
+@@ -0,0 +1,99 @@
++task: object_detection
++model_name: yolov8l
++weight: ../models/weight/object_detection/yolov8l.pt
++onnx_path: ../models/onnx/object_detection/yolov8l.onnx
++onnx_i8_path: ../models/quantized_onnx/object_detection/yolov8l_i8.onnx
++calibration_params:
++  calibration_method: SQNR_ASYM
++  calibration_data: ../datasets/coco/val2017
++  num_calibration_data: 100
++conf_thres: 0.025
++iou_thres: 0.7
++input_shape:
++- 1
++- 3
++- 640
++- 640
++anchors:
++- null
++class_names:
++- person
++- bicycle
++- car
++- motorcycle
++- airplane
++- bus
++- train
++- truck
++- boat
++- traffic light
++- fire hydrant
++- stop sign
++- parking meter
++- bench
++- bird
++- cat
++- dog
++- horse
++- sheep
++- cow
++- elephant
++- bear
++- zebra
++- giraffe
++- backpack
++- umbrella
++- handbag
++- tie
++- suitcase
++- frisbee
++- skis
++- snowboard
++- sports ball
++- kite
++- baseball bat
++- baseball glove
++- skateboard
++- surfboard
++- tennis racket
++- bottle
++- wine glass
++- cup
++- fork
++- knife
++- spoon
++- bowl
++- banana
++- apple
++- sandwich
++- orange
++- broccoli
++- carrot
++- hot dog
++- pizza
++- donut
++- cake
++- chair
++- couch
++- potted plant
++- bed
++- dining table
++- toilet
++- tv
++- laptop
++- mouse
++- remote
++- keyboard
++- cell phone
++- microwave
++- oven
++- toaster
++- sink
++- refrigerator
++- book
++- clock
++- vase
++- scissors
++- teddy bear
++- hair drier
++- toothbrush
+diff --git a/tutorials/cfg/yolov8n.yaml b/tutorials/cfg/yolov8n.yaml
+index 57595b1..cb4d76b 100644
+--- a/tutorials/cfg/yolov8n.yaml
++++ b/tutorials/cfg/yolov8n.yaml
+@@ -6,10 +6,10 @@ onnx_i8_path: ../models/quantized_onnx/object_detection/yolov8n_i8.onnx # CHECK
+ 
+ calibration_params:
+   calibration_method: SQNR_ASYM # calibration method
+-  calibration_data: ../../datasets/coco/val2017          # CHECK you may change this path to your own path
++  calibration_data: datasets/coco/val2017          # CHECK you may change this path to your own path
+   num_calibration_data: 100     # number of calibration data
+ 
+-conf_thres: 0.25
++conf_thres: 0.025
+ iou_thres: 0.7
+ input_shape: [1, 3, 640, 640]         # model input shape (batch channel Height Width)
+ anchors:                        # anchor information
+diff --git a/tutorials/cfg/yolov9c.yaml b/tutorials/cfg/yolov9c.yaml
+new file mode 100644
+index 0000000..496f42f
+--- /dev/null
++++ b/tutorials/cfg/yolov9c.yaml
+@@ -0,0 +1,99 @@
++task: object_detection
++model_name: yolov9c
++weight: ../models/weight/object_detection/yolov9c.pt
++onnx_path: ../models/onnx/object_detection/yolov9c.onnx
++onnx_i8_path: ../models/quantized_onnx/object_detection/yolov9c_i8.onnx
++calibration_params:
++  calibration_method: SQNR_ASYM
++  calibration_data: ../datasets/coco/val2017
++  num_calibration_data: 100
++conf_thres: 0.025
++iou_thres: 0.7
++input_shape:
++- 1
++- 3
++- 640
++- 640
++anchors:
++- null
++class_names:
++- person
++- bicycle
++- car
++- motorcycle
++- airplane
++- bus
++- train
++- truck
++- boat
++- traffic light
++- fire hydrant
++- stop sign
++- parking meter
++- bench
++- bird
++- cat
++- dog
++- horse
++- sheep
++- cow
++- elephant
++- bear
++- zebra
++- giraffe
++- backpack
++- umbrella
++- handbag
++- tie
++- suitcase
++- frisbee
++- skis
++- snowboard
++- sports ball
++- kite
++- baseball bat
++- baseball glove
++- skateboard
++- surfboard
++- tennis racket
++- bottle
++- wine glass
++- cup
++- fork
++- knife
++- spoon
++- bowl
++- banana
++- apple
++- sandwich
++- orange
++- broccoli
++- carrot
++- hot dog
++- pizza
++- donut
++- cake
++- chair
++- couch
++- potted plant
++- bed
++- dining table
++- toilet
++- tv
++- laptop
++- mouse
++- remote
++- keyboard
++- cell phone
++- microwave
++- oven
++- toaster
++- sink
++- refrigerator
++- book
++- clock
++- vase
++- scissors
++- teddy bear
++- hair drier
++- toothbrush
+diff --git a/tutorials/cfg/yolov9s.yaml b/tutorials/cfg/yolov9s.yaml
+new file mode 100644
+index 0000000..627b872
+--- /dev/null
++++ b/tutorials/cfg/yolov9s.yaml
+@@ -0,0 +1,99 @@
++task: object_detection
++model_name: yolov9s
++weight: ../models/weight/object_detection/yolov9s.pt
++onnx_path: ../models/onnx/object_detection/yolov9s.onnx
++onnx_i8_path: ../models/quantized_onnx/object_detection/yolov9s_i8.onnx
++calibration_params:
++  calibration_method: SQNR_ASYM
++  calibration_data: ../datasets/coco/val2017
++  num_calibration_data: 100
++conf_thres: 0.025
++iou_thres: 0.7
++input_shape:
++- 1
++- 3
++- 640
++- 640
++anchors:
++- null
++class_names:
++- person
++- bicycle
++- car
++- motorcycle
++- airplane
++- bus
++- train
++- truck
++- boat
++- traffic light
++- fire hydrant
++- stop sign
++- parking meter
++- bench
++- bird
++- cat
++- dog
++- horse
++- sheep
++- cow
++- elephant
++- bear
++- zebra
++- giraffe
++- backpack
++- umbrella
++- handbag
++- tie
++- suitcase
++- frisbee
++- skis
++- snowboard
++- sports ball
++- kite
++- baseball bat
++- baseball glove
++- skateboard
++- surfboard
++- tennis racket
++- bottle
++- wine glass
++- cup
++- fork
++- knife
++- spoon
++- bowl
++- banana
++- apple
++- sandwich
++- orange
++- broccoli
++- carrot
++- hot dog
++- pizza
++- donut
++- cake
++- chair
++- couch
++- potted plant
++- bed
++- dining table
++- toilet
++- tv
++- laptop
++- mouse
++- remote
++- keyboard
++- cell phone
++- microwave
++- oven
++- toaster
++- sink
++- refrigerator
++- book
++- clock
++- vase
++- scissors
++- teddy bear
++- hair drier
++- toothbrush
+diff --git a/tutorials/cfg/yolov9t.yaml b/tutorials/cfg/yolov9t.yaml
+new file mode 100644
+index 0000000..591fd7b
+--- /dev/null
++++ b/tutorials/cfg/yolov9t.yaml
+@@ -0,0 +1,99 @@
++task: object_detection
++model_name: yolov9t
++weight: ../models/weight/object_detection/yolov9t.pt
++onnx_path: ../models/onnx/object_detection/yolov9t.onnx
++onnx_i8_path: ../models/quantized_onnx/object_detection/yolov9t_i8.onnx
++calibration_params:
++  calibration_method: SQNR_ASYM
++  calibration_data: ../datasets/coco/val2017
++  num_calibration_data: 100
++conf_thres: 0.025
++iou_thres: 0.7
++input_shape:
++- 1
++- 3
++- 640
++- 640
++anchors:
++- null
++class_names:
++- person
++- bicycle
++- car
++- motorcycle
++- airplane
++- bus
++- train
++- truck
++- boat
++- traffic light
++- fire hydrant
++- stop sign
++- parking meter
++- bench
++- bird
++- cat
++- dog
++- horse
++- sheep
++- cow
++- elephant
++- bear
++- zebra
++- giraffe
++- backpack
++- umbrella
++- handbag
++- tie
++- suitcase
++- frisbee
++- skis
++- snowboard
++- sports ball
++- kite
++- baseball bat
++- baseball glove
++- skateboard
++- surfboard
++- tennis racket
++- bottle
++- wine glass
++- cup
++- fork
++- knife
++- spoon
++- bowl
++- banana
++- apple
++- sandwich
++- orange
++- broccoli
++- carrot
++- hot dog
++- pizza
++- donut
++- cake
++- chair
++- couch
++- potted plant
++- bed
++- dining table
++- toilet
++- tv
++- laptop
++- mouse
++- remote
++- keyboard
++- cell phone
++- microwave
++- oven
++- toaster
++- sink
++- refrigerator
++- book
++- clock
++- vase
++- scissors
++- teddy bear
++- hair drier
++- toothbrush

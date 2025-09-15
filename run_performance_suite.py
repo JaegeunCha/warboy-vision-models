@@ -38,6 +38,23 @@ BATCH_MAP = {
 }
 
 # -----------------------------
+# Metrics
+# -----------------------------
+TRANSPOSED_METRICS = [
+    #("e2e_wall_per_image", "e2e_wall (img/s)"),
+    ("e2e_active", "e2e_active (img/s)"),
+    ("infer_only", "infer_only (img/s)"),
+    ("lat_pre", "lat_pre (ms)"),
+    ("lat_infer", "lat_infer (ms)"),
+    ("lat_post", "lat_post (ms)"),
+    ("mAP", "mAP"),
+    ("Target", "Target"),
+    ("Status", "Status"),
+    ("sec", "sec (s)"),
+]
+
+
+# -----------------------------
 # Logging helpers
 # -----------------------------
 def log_line(msg: str, both: bool = True):
@@ -83,17 +100,10 @@ def available_batches_for_model(model: str) -> List[int]:
 
 def get_e2e_wall_imgps(res: dict) -> Optional[float]:
     """
-    Return per-image wall throughput (img/s).
-    Primary: 1000 / latency_ms.e2e_wall.avg
-    Fallback: throughput_img_per_s.e2e_wall_per_image (if provided by runner)
+    Return per-image wall throughput (img/s) computed by runner.
     """
-    lat = res.get("latency_ms", {})
-    e2e_wall_avg = (lat.get("e2e_wall") or {}).get("avg")
-    if e2e_wall_avg and e2e_wall_avg > 0:
-        return 1000.0 / e2e_wall_avg
-    thr = res.get("throughput_img_per_s", {})
-    return thr.get("e2e_wall_per_image")  # may be None on old versions
-
+    comp = res.get("computed", {})
+    return comp.get("e2e_wall_per_image") or res.get("throughput_img_per_s", {}).get("e2e_wall_per_image")
 
 def run_cmd_stream(cmd: List[str]) -> Tuple[int, List[str], bool]:
     log_line(f"RUN: {' '.join(cmd)}")
@@ -255,9 +265,8 @@ def run_one(model: str, batch_size: int) -> Optional[dict]:
         "status": status,
     }
     
-    # NEW: compute per-image wall throughput
-    e2e_wall_imgps = get_e2e_wall_imgps(result)
-    result.setdefault("computed", {})["e2e_wall_per_image"] = e2e_wall_imgps
+    #e2e_wall_imgps = result.get("throughput_img_per_s", {}).get("e2e_wall_per_image")
+    #result.setdefault("computed", {})["e2e_wall_per_image"] = e2e_wall_imgps
 
     thr = result.get("throughput_img_per_s", {})
     lat = result.get("latency_ms", {})
@@ -265,7 +274,8 @@ def run_one(model: str, batch_size: int) -> Optional[dict]:
     log_line(
         "RESULT "
         f"{model} bs={batch_size} | "
-        f"e2e_wall_imgps={e2e_wall_imgps} e2e_active={thr.get('e2e_active')} infer_only={thr.get('infer_only')} | "
+        #f"e2e_wall_imgps={e2e_wall_imgps} e2e_active={thr.get('e2e_active')} infer_only={thr.get('infer_only')} | "
+        f"e2e_active={thr.get('e2e_active')} infer_only={thr.get('infer_only')} | "
         f"lat_pre_avg={(lat.get('pre',{}) or {}).get('avg')} lat_infer_avg={(lat.get('infer',{}) or {}).get('avg')} "
         f"lat_post_avg={(lat.get('post',{}) or {}).get('avg')} | "
         f"mAP={mAP} target={target} status={status} | conf={conf_thres} iou={iou_thres} sec={sec}"
@@ -286,9 +296,11 @@ def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int)
 
     header = f"[batch_size : {batch_size}] : conf ({conf_val}), iou ({iou_val})"
     table = [
-        "| model | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
+        #"| model | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
+        "| model | e2e_active (img/s) | infer_only (img/s) | "
         "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
-        "|-------|-----------------------------|--------------------|--------------------|"
+        #"|-------|-----------------------------|--------------------|--------------------|"
+        "|-------|--------------------|--------------------|"
         "----------------|-----------------|----------------|-----|--------|--------|---------|",
     ]
 
@@ -301,7 +313,8 @@ def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int)
         m = res.get("metrics", {})
         comp = res.get("computed", {})
         row = (
-            f"| {model} | {fmt(comp.get('e2e_wall_per_image'))} | "
+            #f"| {model} | {fmt(comp.get('e2e_wall_per_image'))} | "
+            f"| {model} | "
             f"{fmt(thr.get('e2e_active'))} | {fmt(thr.get('infer_only'))} | "
             f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | "
             f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
@@ -326,9 +339,11 @@ def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
 
     header = f"[model : {model}] : conf ({conf_val}), iou ({iou_val})"
     table = [
-        "| batch_size | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
+        #"| batch_size | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
+        "| batch_size | e2e_active (img/s) | infer_only (img/s) | "
         "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
-        "|------------|-----------------------------|--------------------|--------------------|"
+        #"|------------|-----------------------------|--------------------|--------------------|"
+        "|------------|--------------------|--------------------|"
         "----------------|-----------------|----------------|-----|--------|--------|---------|",
     ]
     for bs in sorted(by_bs.keys()):
@@ -338,7 +353,8 @@ def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
         metrics = res.get("metrics", {})
         comp = res.get("computed", {})
         row = (
-            f"| {bs} | {fmt(comp.get('e2e_wall_per_image'))} | "
+            #f"| {bs} | {fmt(comp.get('e2e_wall_per_image'))} | "
+            f"| {bs} | "
             f"{fmt(thr.get('e2e_active'))} | {fmt(thr.get('infer_only'))} | "
             f"{fmt((lat.get('pre',{}) or {}).get('avg'))} | "
             f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
@@ -363,9 +379,10 @@ def extract_metric_value(res: dict, metric: str):
         res.get("metrics", {}),
         res.get("computed", {}),
     )
-    if metric == "e2e_wall_per_image":
-        return comp.get("e2e_wall_per_image")
-    elif metric == "e2e_active":
+    #if metric == "e2e_wall_per_image":
+    #    return comp.get("e2e_wall_per_image")
+    #elif metric == "e2e_active":
+    if metric == "e2e_active":
         return thr.get("e2e_active")
     elif metric == "infer_only":
         return thr.get("infer_only")
@@ -402,15 +419,9 @@ def summarize_transposed_by_batch(all_results: Dict[str, Dict[int, dict]], batch
             conf_val, iou_val = get_conf_iou(bs_dict[batch_size])
             break
 
-    metrics = [
-        "e2e_wall_per_image", "e2e_active", "infer_only",
-        "lat_pre", "lat_infer", "lat_post",
-        "mAP", "Target", "Status", "sec"
-    ]
-
     rows = []
-    for metric in metrics:
-        row = [metric]
+    for metric, label in TRANSPOSED_METRICS:
+        row = [label]
         for model in models:
             res = all_results[model].get(batch_size)
             if not res:
@@ -440,13 +451,9 @@ def summarize_transposed_by_model(model: str, by_bs: Dict[int, dict]) -> str:
     first_res = next(iter(by_bs.values()))
     conf_val, iou_val = get_conf_iou(first_res)
 
-    metrics = ["e2e_wall_per_image", "e2e_active", "infer_only",
-               "lat_pre", "lat_infer", "lat_post",
-               "mAP", "Target", "Status", "sec"]
-
     rows = []
-    for metric in metrics:
-        row = [metric]
+    for metric, label in TRANSPOSED_METRICS:
+        row = [label]
         for bs in batch_sizes:
             res = by_bs[bs]
             val = extract_metric_value(res, metric)
