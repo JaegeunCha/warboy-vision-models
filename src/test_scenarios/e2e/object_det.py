@@ -17,6 +17,8 @@ from ...warboy import get_model_params_from_cfg
 from ...warboy.utils.process_pipeline import Engine, Image, ImageList, PipeLine
 from ...warboy.yolo.preprocess import YoloPreProcessor
 
+from pathlib import Path
+
 from ..utils import (
     YOLO_CATEGORY_TO_COCO_CATEGORY,
     MSCOCODataLoader,
@@ -46,6 +48,17 @@ TARGET_ACCURACY = {
     "yolov5x6u": 0.568,
 }
 
+# COCO 80 클래스 이름 (YOLO order)
+COCO_NAMES = [
+ "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
+ "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow",
+ "elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
+ "skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle",
+ "wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich","orange",
+ "broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant","bed",
+ "dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven",
+ "toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"
+]
 
 # ------------------------------------------------------
 # Helpers
@@ -166,7 +179,7 @@ def test_warboy_yolo_accuracy_det(cfg: str, image_dir: str, annotation_file: str
 
 
 def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotation_file: str,
-                                     use_enf=True, batch_size: int=1, save_samples: int=0, sample_start: int=1000):
+                                     use_enf=True, batch_size: int=1, save_samples: int=0, sample_start: int=1001):
     """성능/정확도 테스트: latency, throughput, mAP"""
 
     param = get_model_params_from_cfg(config_file)
@@ -186,7 +199,10 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
         model_path = param.get("onnx_i8_path") or os.path.join(QUANTIZED_ONNX_DIR, param["task"], param["onnx_i8_path"])
 
     # 이미지 준비
-    image_names = os.listdir(image_dir)
+    #image_names = os.listdir(image_dir)
+    image_names = sorted(
+        [n for n in os.listdir(image_dir) if n.lower().endswith((".jpg",".jpeg",".png"))]
+    )
     images = [Image(image_info=os.path.join(image_dir, n)) for n in image_names]
 
     preprocessor = YoloPreProcessor(new_shape=input_shape[2:])
@@ -214,7 +230,9 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
                     timings=TIMINGS,
                     save_samples=save_samples,
                     sample_start=sample_start,
-                    save_dir=str(save_dir))
+                    save_dir=str(save_dir),
+                    sample_by="stem",
+                    class_names=COCO_NAMES,)
     
     for idx, engin in enumerate(engin_configs):
         engin["model"] = model_path

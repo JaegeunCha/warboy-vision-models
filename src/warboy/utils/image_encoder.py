@@ -1,9 +1,11 @@
 import time
-from typing import Callable
+from typing import Callable, List, Optional
 
 from .queue import PipeLineQueue, QueueClosedError, StopSig
 
-import numpy as np
+from pathlib import Path
+import cv2, numpy as np
+
 class ImageEncoder:
     def __init__(
         self,
@@ -54,18 +56,22 @@ class PredictionEncoder:
         result_mux: PipeLineQueue,
         postprocess_function: Callable,
         timings = None,
+        class_names: Optional[List[str]] = None,
         save_samples: int = 0,
-        sample_start: int = 1000,
+        sample_start: int = 1001,   # COCO stem ID 시작 기본값(요청대로 1001)
         save_dir: str = "outputs",
+        sample_by: str = "stem",    # "stem" | "index" (기본 stem)
     ):
         self.frame_mux = frame_mux
         self.output_mux = output_mux
         self.result_mux = result_mux
         self.postprocessor = postprocess_function
         self.timings = timings
-        self.save_samples = save_samples
-        self.sample_start = sample_start
-        self.save_dir = save_dir
+        self.class_names = class_names or []
+        self.save_samples = int(save_samples or 0)
+        self.sample_start = int(sample_start or 0)
+        self.save_dir = Path(save_dir)
+        self.sample_by = sample_by
 
     def run(self):
         while True:
@@ -108,30 +114,86 @@ class PredictionEncoder:
                               f"e2e_active={e2e_active:.3f} ms "
                               f"e2e_wall={e2e_wall_str}")     
                         
-                # --- 저장: sample_start ≤ idx < sample_start + save_samples ---
-                if self.save_samples and self.sample_start <= img_idx < self.sample_start + self.save_samples:
-                    import os, cv2, numpy as np
-                    os.makedirs(self.save_dir, exist_ok=True)
-                    draw = frame.copy()
+                ## --- 저장: sample_start ≤ idx < sample_start + save_samples ---
+                #if self.save_samples and self.sample_start <= img_idx < self.sample_start + self.save_samples:
+                #    import os, cv2, numpy as np
+                #    os.makedirs(self.save_dir, exist_ok=True)
+                #    draw = frame.copy()
 
-                    # preds: list/tuple → 첫 요소 (배치=1)
-                    det = preds[0] if isinstance(preds, (list, tuple)) else preds
-                    if det is not None and len(det):
-                        for xyxyc in det:
-                            x1, y1, x2, y2, conf, cls = xyxyc[:6]
-                            p1 = (int(x1), int(y1)); p2 = (int(x2), int(y2))
-                            cv2.rectangle(draw, p1, p2, (0,255,0), 2)
-                            cv2.putText(draw, f"{int(cls)} {float(conf):.2f}",
-                                        (p1[0], max(p1[1]-4, 0)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
-                    out_path = os.path.join(self.save_dir, f"{img_idx:06d}_pred.jpg")
-                    try:
-                        cv2.imwrite(out_path, draw)
-                        if img_idx < self.sample_start + 3:
-                            print(f"[PredictionEncoder] saved: {out_path}")
-                    except Exception as e:
-                        print(f"[PredictionEncoder] save error: {e}")      
-                               
+                #    # preds: list/tuple → 첫 요소 (배치=1)
+                #    det = preds[0] if isinstance(preds, (list, tuple)) else preds
+                #    if det is not None and len(det):
+                #        for xyxyc in det:
+                #            x1, y1, x2, y2, conf, cls = xyxyc[:6]
+                #            p1 = (int(x1), int(y1)); p2 = (int(x2), int(y2))
+                #            cv2.rectangle(draw, p1, p2, (0,255,0), 2)
+                #            cv2.putText(draw, f"{int(cls)} {float(conf):.2f}",
+                #                        (p1[0], max(p1[1]-4, 0)),
+                #                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                #    out_path = os.path.join(self.save_dir, f"{img_idx:06d}_pred.jpg")
+                #    try:
+                #        cv2.imwrite(out_path, draw)
+                #        if img_idx < self.sample_start + 3:
+                #            print(f"[PredictionEncoder] saved: {out_path}")
+                #    except Exception as e:
+                #        print(f"[PredictionEncoder] save error: {e}")      
+
+                # -------------------------------
+                # 샘플 저장 (bbox + label)
+                # -------------------------------
+                if self.save_samples > 0:
+                    # 저장 대상인지 판정
+                    should_save = False
+
+                    # 컨텍스트/인덱스 확보
+                    img_path = None
+                    if isinstance(context, dict):
+                        img_path = context.get("image_path")
+
+                    if self.sample_by == "stem" and img_path:
+                        # COCO 파일명 → 정수 stem ID
+                        try:
+                            stem_id = int(Path(img_path).stem)
+                        except Exception:
+                            stem_id = None
+                        if stem_id is not None:
+                            if self.sample_start <= stem_id < self.sample_start + self.save_samples:
+                                should_save = True
+                    else:
+                        # index 방식 (전/후방 호환)
+                        if self.sample_start <= img_idx < self.sample_start + self.save_samples:
+                            should_save = True
+
+                    if should_save:
+                        draw = frame.copy()
+                        # preds 형상 표준화: (N, >=6) [x1,y1,x2,y2,conf,cls]
+                        dets = preds[0] if isinstance(preds, (list, tuple)) else preds
+                        if dets is not None:
+                            nd = np.asarray(dets)
+                            if nd.ndim == 2 and nd.shape[1] >= 6 and nd.shape[0] > 0:
+                                for row in nd:
+                                    x1, y1, x2, y2, conf, cls = row[:6]
+                                    p1 = (int(x1), int(y1))
+                                    p2 = (int(x2), int(y2))
+                                    cv2.rectangle(draw, p1, p2, (0, 255, 0), 2)
+                                    
+                                    # 클래스 이름 매핑
+                                    name = (
+                                        self.class_names[int(cls)]
+                                        if self.class_names and 0 <= int(cls) < len(self.class_names)
+                                        else str(int(cls))
+                                    )
+                                    label = f"{name} {float(conf):.2f}"
+                                    cv2.putText(draw, label, (p1[0], max(p1[1]-4, 0)),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+                        # 저장 경로
+                        stem = Path(img_path).stem if img_path else f"{img_idx:06d}"
+                        out_path = self.save_dir / f"{stem}_pred.jpg"
+                        self.save_dir.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(out_path), draw)
+
+
                 if not self.result_mux is None:
                     self.result_mux.put((preds, 0.0, img_idx))
             except QueueClosedError:

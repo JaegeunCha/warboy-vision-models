@@ -67,8 +67,10 @@ class PipeLine:
         make_file_output: bool = False,
         timings = None,
         save_samples: int = 0,
-        sample_start: int = 1000,
+        sample_start: int = 1001,
         save_dir: str = "outputs",
+        sample_by: str = "stem",
+        class_names = None,
     ):
         self.run_fast_api = run_fast_api
         self.run_e2e_test = run_e2e_test
@@ -99,6 +101,8 @@ class PipeLine:
         self.save_samples = save_samples
         self.sample_start = sample_start
         self.save_dir = save_dir
+        self.sample_by = sample_by
+        self.class_names = class_names or []
 
     def add(self, obj, name: str = "", postprocess_as_img=True):
         print(isinstance(obj, Engine))
@@ -236,7 +240,10 @@ class PipeLine:
                         timings=self.timings,
                         save_samples=self.save_samples,
                         sample_start=self.sample_start,
-                        save_dir=self.save_dir,                        
+                        save_dir=self.save_dir,     
+                        class_names=self.class_names,
+                        sample_by=self.sample_by,
+
                     )
                 )
         else:

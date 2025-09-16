@@ -6,6 +6,7 @@ from ..yolo.preprocess import YoloPreProcessor
 from .queue import PipeLineQueue, QueueClosedError, StopSig
 
 import time
+from pathlib import Path
 
 class ImageListDecoder:
     def __init__(
@@ -46,7 +47,18 @@ class ImageListDecoder:
 
                     if img_idx < 5:
                         print(f"[Decoder] {img_idx} pre={pre_ms:.3f} ms")
-                    
+
+                # 원본 이미지 경로를 컨텍스트에 담아 PredictionEncoder까지 전달
+                # image_list 요소는 보통 image.image_info에 경로가 들어있음
+                try:
+                    image_path = getattr(self.image_list[img_idx], "image_info", None)
+                except Exception:
+                    image_path = None
+                if not isinstance(context, dict):
+                    context = {}
+                if image_path is not None:
+                    context["image_path"] = str(image_path)
+
                 self.stream_mux.put((input_, img_idx))
                 self.frame_mux.put((img, context, img_idx))
                 img_idx += 1
