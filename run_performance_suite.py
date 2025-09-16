@@ -210,16 +210,25 @@ def ensure_cfg_yaml(model: str, cfg_dir: Path):
 # -----------------------------
 # Suite Runner
 # -----------------------------
-def run_one(model: str, batch_size: int) -> Optional[dict]:
+def run_one(model: str, batch_size: int, save_samples: int, sample_start: int) -> Optional[dict]:
     base = base_model_name(model)
     cfg_path = ensure_cfg_yaml(base, CFG_DIR)
 
     retries = 3
+    #for attempt in range(retries):
+    #    rc, lines, oom = run_cmd_stream([
+    #        "warboy-vision","model-performance",
+    #        "--config_file",str(cfg_path),"--batch-size",str(batch_size)
+    #    ])
     for attempt in range(retries):
-        rc, lines, oom = run_cmd_stream([
+        cmd = [
             "warboy-vision","model-performance",
-            "--config_file",str(cfg_path),"--batch-size",str(batch_size)
-        ])
+            "--config_file",str(cfg_path),
+            "--batch-size",str(batch_size),
+            "--save-samples",str(save_samples),
+            "--sample-start",str(sample_start),
+        ]
+        rc, lines, oom = run_cmd_stream(cmd)
 
         if oom:
             try:
@@ -477,7 +486,10 @@ def summarize_transposed_by_model(model: str, by_bs: Dict[int, dict]) -> str:
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--detach", action="store_true")
+    parser.add_argument("--save-sample","--save-samples", type=int, default=10,
+                        help="Save N sample images per model to outputs/ (0=disable).")
+    parser.add_argument("--sample-start", type=int, default=1000,
+                        help="Global index start (0-based). 1000 means 1001st image.")
     args = parser.parse_args()
     delay = 5
     
@@ -511,7 +523,8 @@ def main():
         model_results: Dict[int, dict] = {}
 
         for bs in batches:
-            res = run_one(model, bs)
+            #res = run_one(model, bs)
+            res = run_one(model, bs, save_samples=args.save_sample, sample_start=args.sample_start)
             if res:
                 model_results[bs] = res
 

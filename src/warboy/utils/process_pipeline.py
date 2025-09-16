@@ -66,6 +66,9 @@ class PipeLine:
         make_image_output: bool = False,
         make_file_output: bool = False,
         timings = None,
+        save_samples: int = 0,
+        sample_start: int = 1000,
+        save_dir: str = "outputs",
     ):
         self.run_fast_api = run_fast_api
         self.run_e2e_test = run_e2e_test
@@ -93,6 +96,9 @@ class PipeLine:
         self.results = []
 
         self.timings = timings if timings is not None else {}
+        self.save_samples = save_samples
+        self.sample_start = sample_start
+        self.save_dir = save_dir
 
     def add(self, obj, name: str = "", postprocess_as_img=True):
         print(isinstance(obj, Engine))
@@ -228,6 +234,9 @@ class PipeLine:
                         result_mux=new_result_mux,
                         postprocess_function=self.postprocess_functions[name],
                         timings=self.timings,
+                        save_samples=self.save_samples,
+                        sample_start=self.sample_start,
+                        save_dir=self.save_dir,                        
                     )
                 )
         else:

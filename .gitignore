@@ -247,3 +247,8 @@ outputs/
 __MACOSX
 # Do not commit .DS_Store
 .DS_Store
+
+
+logs
+outputs
+*.log

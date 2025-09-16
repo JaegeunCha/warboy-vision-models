@@ -166,7 +166,7 @@ def test_warboy_yolo_accuracy_det(cfg: str, image_dir: str, annotation_file: str
 
 
 def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotation_file: str,
-                                     use_enf=True, batch_size: int=1):
+                                     use_enf=True, batch_size: int=1, save_samples: int=0, sample_start: int=1000):
     """성능/정확도 테스트: latency, throughput, mAP"""
 
     param = get_model_params_from_cfg(config_file)
@@ -197,7 +197,25 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
     TIMINGS = manager.dict()
 
     # Pipeline
-    task = PipeLine(run_fast_api=False, run_e2e_test=True, num_channels=len(images), timings=TIMINGS)
+    #task = PipeLine(run_fast_api=False, run_e2e_test=True, num_channels=len(images), timings=TIMINGS)
+    
+    #outputs/<model_name> 초기화 (요청 시)
+    import shutil
+    save_dir = Path("outputs") / model_name
+    if save_samples > 0:
+        if save_dir.exists():
+            shutil.rmtree(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pipeline
+    task = PipeLine(run_fast_api=False,
+                    run_e2e_test=True,
+                    num_channels=len(images),
+                    timings=TIMINGS,
+                    save_samples=save_samples,
+                    sample_start=sample_start,
+                    save_dir=str(save_dir))
+    
     for idx, engin in enumerate(engin_configs):
         engin["model"] = model_path
         #print("[Engine Config]", json.dumps(engin, indent=2, default=str)) 

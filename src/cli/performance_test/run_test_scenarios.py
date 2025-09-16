@@ -22,7 +22,22 @@ from ...warboy import get_model_params_from_cfg
     show_default=True,
     help="Override batch size for inference (default: 1).",
 )
-def run_e2e_test(config_file: str, batch_size: int):
+@click.option(
+    "--save-samples",
+    "--save-sample",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Save N sample prediction images with boxes+labels to outputs/ (0=disable).",
+)
+@click.option(
+    "--sample-start",
+    type=int,
+    default=1000,
+    show_default=True,
+    help="Global index start (0-based). 1000 means 1001st image.",
+)
+def run_e2e_test(config_file: str, batch_size: int, save_samples: int, sample_start: int):
     ANNOTATION_DIR = (
         "../datasets/coco/annotations"  # CHECK you may change this to your own path
     )
@@ -52,7 +67,7 @@ def run_e2e_test(config_file: str, batch_size: int):
             "Invalid task type. Choose from 'object_detection', 'pose_estimation', or 'instance_segmentation'."
         )
 
-    func(config_file, image_dir, annotation, batch_size=batch_size)
+    func(config_file, image_dir, annotation, batch_size=batch_size, save_samples=save_samples, sample_start=sample_start)
 
 
 @click.command(

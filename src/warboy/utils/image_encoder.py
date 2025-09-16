@@ -54,12 +54,18 @@ class PredictionEncoder:
         result_mux: PipeLineQueue,
         postprocess_function: Callable,
         timings = None,
+        save_samples: int = 0,
+        sample_start: int = 1000,
+        save_dir: str = "outputs",
     ):
         self.frame_mux = frame_mux
         self.output_mux = output_mux
         self.result_mux = result_mux
         self.postprocessor = postprocess_function
         self.timings = timings
+        self.save_samples = save_samples
+        self.sample_start = sample_start
+        self.save_dir = save_dir
 
     def run(self):
         while True:
@@ -100,7 +106,32 @@ class PredictionEncoder:
                         e2e_wall_str = f"{e2e_val:.3f} ms" if e2e_val is not None else "NA"
                         print(f"[Encoder] {img_idx} post={post_ms:.3f} ms "
                               f"e2e_active={e2e_active:.3f} ms "
-                              f"e2e_wall={e2e_wall_str}")                    
+                              f"e2e_wall={e2e_wall_str}")     
+                        
+                # --- 저장: sample_start ≤ idx < sample_start + save_samples ---
+                if self.save_samples and self.sample_start <= img_idx < self.sample_start + self.save_samples:
+                    import os, cv2, numpy as np
+                    os.makedirs(self.save_dir, exist_ok=True)
+                    draw = frame.copy()
+
+                    # preds: list/tuple → 첫 요소 (배치=1)
+                    det = preds[0] if isinstance(preds, (list, tuple)) else preds
+                    if det is not None and len(det):
+                        for xyxyc in det:
+                            x1, y1, x2, y2, conf, cls = xyxyc[:6]
+                            p1 = (int(x1), int(y1)); p2 = (int(x2), int(y2))
+                            cv2.rectangle(draw, p1, p2, (0,255,0), 2)
+                            cv2.putText(draw, f"{int(cls)} {float(conf):.2f}",
+                                        (p1[0], max(p1[1]-4, 0)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                    out_path = os.path.join(self.save_dir, f"{img_idx:06d}_pred.jpg")
+                    try:
+                        cv2.imwrite(out_path, draw)
+                        if img_idx < self.sample_start + 3:
+                            print(f"[PredictionEncoder] saved: {out_path}")
+                    except Exception as e:
+                        print(f"[PredictionEncoder] save error: {e}")      
+                               
                 if not self.result_mux is None:
                     self.result_mux.put((preds, 0.0, img_idx))
             except QueueClosedError:
