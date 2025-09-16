@@ -26,8 +26,11 @@ ENF_DIR = REPO_ROOT / ".." / "models" / "enf" / "object_detection"
 
 # 실행 시점 기반 로그 파일명
 START_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
-FULL_LOG_FILE = REPO_ROOT / f"performance_full_{START_TS}.log"   # 전체 로그
-RESULT_LOG_FILE = REPO_ROOT / f"performance_result_{START_TS}.log"  # 요약 로그
+LOG_DIR = REPO_ROOT / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+FULL_LOG_FILE = LOG_DIR / f"performance_full_{START_TS}.log"   # 전체 로그
+RESULT_LOG_FILE = LOG_DIR / f"performance_result_{START_TS}.log"  # 요약 로그
 
 BATCH_MAP = {
     1: "{model}.enf",
