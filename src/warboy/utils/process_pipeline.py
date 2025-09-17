@@ -107,6 +107,7 @@ class PipeLine:
     def add(self, obj, name: str = "", postprocess_as_img=True):
         print(isinstance(obj, Engine))
         if isinstance(obj, Engine):
+            batch_size = obj.batch_size
             self.runtime_info[obj.name] = {
                 "model": obj.model,
                 "worker_num": obj.worker_num,
@@ -243,7 +244,7 @@ class PipeLine:
                         save_dir=self.save_dir,     
                         class_names=self.class_names,
                         sample_by=self.sample_by,
-
+                        batch_size=self.runtime_info[name]["batch_size"],
                     )
                 )
         else:

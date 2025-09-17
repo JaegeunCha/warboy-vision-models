@@ -60,7 +60,8 @@ class PredictionEncoder:
         save_samples: int = 0,
         sample_start: int = 1001,   # COCO stem ID 시작 기본값(요청대로 1001)
         save_dir: str = "outputs",
-        sample_by: str = "stem",    # "stem" | "index" (기본 stem)
+        sample_by: str = "stem",    # "stem" | "index" (기본 stem)       
+        batch_size: int = 1, 
     ):
         self.frame_mux = frame_mux
         self.output_mux = output_mux
@@ -72,6 +73,8 @@ class PredictionEncoder:
         self.sample_start = int(sample_start or 0)
         self.save_dir = Path(save_dir)
         self.sample_by = sample_by
+        self.save_dir_root = Path(save_dir)
+        self.batch_size = batch_size
 
     def run(self):
         while True:
@@ -161,7 +164,7 @@ class PredictionEncoder:
                                 should_save = True
                     else:
                         # index 방식 (전/후방 호환)
-                        if self.sample_start <= img_idx < self.sample_start + self.save_samples:
+                        if self.sample_start <= img_idx + 1 < self.sample_start + self.save_samples:
                             should_save = True
 
                     if should_save:
@@ -187,12 +190,13 @@ class PredictionEncoder:
                                     cv2.putText(draw, label, (p1[0], max(p1[1]-4, 0)),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
 
-                        # 저장 경로
+                        # 저장 경로: outputs/{model명}_{batch_size}/
                         stem = Path(img_path).stem if img_path else f"{img_idx:06d}"
-                        out_path = self.save_dir / f"{stem}_pred.jpg"
-                        self.save_dir.mkdir(parents=True, exist_ok=True)
+                        model_bs_dir = self.save_dir_root.parent / f"{self.save_dir_root.name}_{self.batch_size}"
+                        model_bs_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = model_bs_dir / f"{stem}_pred.jpg"
                         cv2.imwrite(str(out_path), draw)
-
+                        #print(f"[PredictionEncoder] saved: {out_path}")
 
                 if not self.result_mux is None:
                     self.result_mux.put((preds, 0.0, img_idx))

@@ -225,9 +225,12 @@ def run_one(model: str, batch_size: int, save_samples: int, sample_start: int) -
             "warboy-vision","model-performance",
             "--config_file",str(cfg_path),
             "--batch-size",str(batch_size),
-            "--save-samples",str(save_samples),
-            "--sample-start",str(sample_start),
         ]
+        # sample 저장 옵션 처리
+        if save_samples > 0:
+            cmd += ["--save-samples", str(save_samples)]
+            if sample_start:
+                cmd += ["--sample-start", str(sample_start)]
         rc, lines, oom = run_cmd_stream(cmd)
 
         if oom:
@@ -486,10 +489,11 @@ def summarize_transposed_by_model(model: str, by_bs: Dict[int, dict]) -> str:
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--save-sample","--save-samples", type=int, default=10,
-                        help="Save N sample images per model to outputs/ (0=disable).")
-    parser.add_argument("--sample-start", type=int, default=1000,
-                        help="Global index start (0-based). 1000 means 1001st image.")
+    parser.add_argument("--save-samples", type=int, default=0,
+                        help="Save N sample images per model to outputs/(model_bs)/ (0=disable).")
+    parser.add_argument("--sample-start", type=int, default=None,
+                        help="Starting dataset index (1-based) for saving samples. "
+                             "Valid only if --save-samples > 0")
     args = parser.parse_args()
     delay = 5
     
@@ -523,8 +527,9 @@ def main():
         model_results: Dict[int, dict] = {}
 
         for bs in batches:
-            #res = run_one(model, bs)
-            res = run_one(model, bs, save_samples=args.save_sample, sample_start=args.sample_start)
+            res = run_one(model, bs,
+                          save_samples=args.save_samples,
+                          sample_start=(args.sample_start if args.save_samples > 0 else None))
             if res:
                 model_results[bs] = res
 

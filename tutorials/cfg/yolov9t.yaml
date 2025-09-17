@@ -7,8 +7,8 @@ calibration_params:
   calibration_method: SQNR_ASYM
   calibration_data: ../datasets/coco/val2017
   num_calibration_data: 100
-conf_thres: 0.25
-iou_thres: 0.45
+conf_thres: 0.025
+iou_thres: 0.6
 input_shape:
 - 1
 - 3
