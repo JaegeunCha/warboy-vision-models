@@ -53,7 +53,7 @@ TRANSPOSED_METRICS = [
     ("mAP", "mAP"),
     ("Target", "Target"),
     ("Status", "Status"),
-    ("sec", "sec (s)"),
+    #("sec", "sec (s)"),
 ]
 
 
@@ -274,7 +274,7 @@ def run_one(model: str, batch_size: int, save_samples: int, sample_start: int) -
     result["metrics"] = {
         "conf_thres": conf_thres,
         "iou_thres": iou_thres,
-        "sec": sec,
+        #"sec": sec,
         "mAP": mAP,
         "target": target,
         "status": status,
@@ -293,7 +293,8 @@ def run_one(model: str, batch_size: int, save_samples: int, sample_start: int) -
         f"e2e_active={thr.get('e2e_active')} infer_only={thr.get('infer_only')} | "
         f"lat_pre_avg={(lat.get('pre',{}) or {}).get('avg')} lat_infer_avg={(lat.get('infer',{}) or {}).get('avg')} "
         f"lat_post_avg={(lat.get('post',{}) or {}).get('avg')} | "
-        f"mAP={mAP} target={target} status={status} | conf={conf_thres} iou={iou_thres} sec={sec}"
+        #f"mAP={mAP} target={target} status={status} | conf={conf_thres} iou={iou_thres} sec={sec}"
+        f"mAP={mAP} target={target} status={status} | conf={conf_thres} iou={iou_thres}"
     )
     log_line("")
     return result
@@ -313,10 +314,12 @@ def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int)
     table = [
         #"| model | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
         "| model | e2e_active (img/s) | infer_only (img/s) | "
-        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
+        #"lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
+        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status |",
         #"|-------|-----------------------------|--------------------|--------------------|"
         "|-------|--------------------|--------------------|"
-        "----------------|-----------------|----------------|-----|--------|--------|---------|",
+        #"----------------|-----------------|----------------|-----|--------|--------|---------|",
+        "--------------|----------------|---------------|-----|--------|---------|",
     ]
 
     for model, by_bs in all_results.items():
@@ -335,7 +338,7 @@ def summarize_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int)
             f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
             f"{fmt((lat.get('post',{}) or {}).get('avg'))} | "
             f"{fmt(m.get('mAP'))} | {fmt(m.get('target'))} | {m.get('status') or 'NA'} | "
-            f"{fmt(m.get('sec'))} |"
+            #f"{fmt(m.get('sec'))} |"
         )
         table.append(row)
 
@@ -356,10 +359,12 @@ def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
     table = [
         #"| batch_size | e2e_wall_per_image (img/s) | e2e_active (img/s) | infer_only (img/s) | "
         "| batch_size | e2e_active (img/s) | infer_only (img/s) | "
-        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
+        #"lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status | sec (s) |",
+        "lat_pre (ms) | lat_infer (ms) | lat_post (ms) | mAP | Target | Status |",
         #"|------------|-----------------------------|--------------------|--------------------|"
         "|------------|--------------------|--------------------|"
-        "----------------|-----------------|----------------|-----|--------|--------|---------|",
+        #"----------------|-----------------|----------------|-----|--------|--------|---------|",
+        "--------------|----------------|---------------|-----|--------|---------|",
     ]
     for bs in sorted(by_bs.keys()):
         res = by_bs[bs]
@@ -375,7 +380,7 @@ def summarize_by_model(model: str, by_bs: Dict[int, dict]) -> str:
             f"{fmt((lat.get('infer',{}) or {}).get('avg'))} | "
             f"{fmt((lat.get('post',{}) or {}).get('avg'))} | "
             f"{fmt(metrics.get('mAP'))} | {fmt(metrics.get('target'))} | {metrics.get('status') or 'NA'} | "
-            f"{fmt(metrics.get('sec'))} |"
+            #f"{fmt(metrics.get('sec'))} |"
         )
         table.append(row)
     return "\n".join([header, ""] + table + [""])
@@ -417,8 +422,8 @@ def extract_metric_value(res: dict, metric: str):
         return m.get("conf_thres")
     elif metric == "iou":
         return m.get("iou_thres")
-    elif metric == "sec":
-        return m.get("sec")
+    #elif metric == "sec":
+    #    return m.get("sec")
     return None
 
 def summarize_transposed_by_batch(all_results: Dict[str, Dict[int, dict]], batch_size: int) -> str:
