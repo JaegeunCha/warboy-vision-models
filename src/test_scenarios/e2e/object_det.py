@@ -192,7 +192,8 @@ def test_warboy_yolo_performance_det(config_file: str, image_dir: str, annotatio
     # ENF 경로 확인
     if use_enf:
         enf_file = f"{model_name}_{batch_size}b.enf" if batch_size > 1 else f"{model_name}.enf"
-        enf_path = ENF_DIR / param["task"] / enf_file
+        #enf_path = ENF_DIR / param["task"] / enf_file
+        enf_path = ENF_DIR / enf_file
         if enf_path.is_file(): model_path = str(enf_path)
         else: raise FileNotFoundError(f"ENF file not found: {enf_path}")
     else:

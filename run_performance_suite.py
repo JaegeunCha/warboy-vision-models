@@ -22,7 +22,7 @@ import yaml
 # -----------------------------
 REPO_ROOT = Path.cwd()
 CFG_DIR = REPO_ROOT / "tutorials" / "cfg"
-ENF_DIR = REPO_ROOT / ".." / "models" / "enf" / "object_detection"
+ENF_DIR = REPO_ROOT / ".." / "models" / "enf" 
 
 # 실행 시점 기반 로그 파일명
 START_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -187,9 +187,9 @@ def ensure_cfg_yaml(model: str, cfg_dir: Path):
     cfg = {
         "task": "object_detection",
         "model_name": model,
-        "weight": f"../models/weight/object_detection/{model}.pt",
-        "onnx_path": f"../models/onnx/object_detection/{model}.onnx",
-        "onnx_i8_path": f"../models/quantized_onnx/object_detection/{model}_i8.onnx",
+        "weight": f"../models/weight/{model}.pt",
+        "onnx_path": f"../models/onnx/{model}.onnx",
+        "onnx_i8_path": f"../models/quantized_onnx/{model}_i8.onnx",
         "calibration_params": {
             "calibration_method": "SQNR_ASYM",
             "calibration_data": "../datasets/coco/val2017",
