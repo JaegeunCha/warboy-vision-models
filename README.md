@@ -1,254 +1,258 @@
-# Warboy-Vision-Models
-The `warboy-vision-models` project is designed to assist users in running various deep learning vision models on [FuriosaAI](https://furiosa.ai/)’s first generation NPU (Neural Processing Unit), Warboy. 
+# warboy-vision-models 환경 설정 가이드
+
+## 개요
+
+이 문서는 `yolo-od-test` 프로젝트의 Furiosa Warboy NPU 기반 비전 모델 환경을 구성하고 실행하는 방법을 설명합니다.
+rsync 서버에 저장된 데이터를 다운로드하고, `warboy-vision-models`를 git clone으로 받아 환경을 완성합니다.
+
+## 사전 요구사항
+
+- rsync 서버(기본: `10.254.202.100`)에 SSH 접속이 가능해야 합니다
+- `rsync`, `git`, `python3` 명령어가 설치되어 있어야 합니다
+- `tree`는 스크립트가 자동으로 설치합니다
+- Furiosa SDK가 설치되어 있어야 합니다
+
+## 설정 방법
+
+### 1. 설정 스크립트 다운로드
+
+rsync 서버에서 설정 스크립트를 다운로드합니다. (서버 IP는 환경에 맞게 변경)
+
+```bash
+scp kcloud@<서버IP>:~/data/setup_yolo_od_test.sh .
+```
+
+### 2. 스크립트 실행
+
+```bash
+chmod +x setup_yolo_od_test.sh
+
+# 대화형으로 실행 (서버 IP 확인 → nvidia / furiosa / all 선택)
+./setup_yolo_od_test.sh
+
+# 또는 환경변수로 지정 (비대화형)
+SERVER_A=10.254.202.100 SETUP_TARGET=furiosa ./setup_yolo_od_test.sh
+```
+
+스크립트가 수행하는 작업:
+1. rsync 서버에서 선택한 대상의 데이터를 다운로드 (`warboy-vision-models`, `yolov9`, `venv`, 서버 전용 파일 제외)
+2. `warboy-vision-models`를 git clone
+3. `furiosa/venv` Python 가상환경 신규 생성 및 패키지 설치
+4. C++ 빌드 의존성 설치 (`cmake`, `libeigen3-dev`)
+5. Post-processing 유틸리티 빌드 (`build.sh` — cbox_decode, cpose_decode, cbytetrack `.so` 파일 생성)
+6. `warboy-vision` CLI 패키지 설치 (`pip install .`)
+
+### 3. 환경 변수
+
+```bash
+# 서버 IP (기본값: 10.254.202.100, 미지정 시 대화형으로 확인)
+SERVER_A=10.254.202.100
+
+# 설치 대상 (미지정 시 대화형으로 선택)
+SETUP_TARGET=furiosa   # nvidia, furiosa, all
+
+# SSH 사용자명 (기본값: kcloud)
+SERVER_USER=myuser
+
+# 로컬 저장 경로 (기본값: 현재 디렉토리)
+LOCAL_BASE_DIR=/home/myuser/workspace
+```
+
+### 4. 추가 설치
+
+이미 furiosa만 설치한 상태에서 nvidia를 추가할 수 있습니다:
+
+```bash
+SETUP_TARGET=nvidia ./setup_yolo_od_test.sh
+```
+
+### 5. 소스 코드 수정 시
+
+`warboy-vision-models` 소스 코드를 수정한 경우, 변경 사항을 반영하려면 venv에서 다시 설치해야 합니다:
+
+```bash
+source ~/yolo-od-test/furiosa/venv/bin/activate
+cd ~/yolo-od-test/furiosa/warboy-vision-models
+
+# C++ 코드 수정 시 빌드도 다시 실행
+bash build.sh
+
+# 패키지 재설치
+pip install .
+
+deactivate
+```
+
+## 실행 방법
+
+### venv 활성화
+
+모든 실행 명령은 furiosa venv를 활성화한 상태에서 수행해야 합니다.
+
+```bash
+source ~/yolo-od-test/furiosa/venv/bin/activate
+cd ~/yolo-od-test/furiosa/warboy-vision-models
+```
+
+### run_performance_suite.py — E2E 성능 평가
+
+`models/enf/` 디렉토리의 ENF 파일을 자동 탐지하여 모든 모델, 모든 배치 사이즈에 대해 성능 평가를 수행합니다.
+
+```bash
+# 기본 실행 (모든 모델, 모든 배치 사이즈)
+python3 run_performance_suite.py
+
+# 샘플 이미지 저장 (예: 10장)
+python3 run_performance_suite.py --save-samples 10
+
+# 샘플 이미지 저장 시작 인덱스 지정 (1-based)
+python3 run_performance_suite.py --save-samples 10 --sample-start 5
+```
+
+주요 옵션:
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--save-samples` | `0` | 저장할 샘플 이미지 수 (0=비활성) |
+| `--sample-start` | `None` | 샘플 저장 시작 인덱스 (1-based, `--save-samples > 0`일 때만 유효) |
+
+결과 로그는 `logs/` 디렉토리에 저장됩니다:
+- `performance_full_YYYYMMDD_HHMMSS.log` — 전체 실행 로그
+- `performance_result_YYYYMMDD_HHMMSS.log` — 요약 결과 테이블 (모델별/배치별 Markdown)
+
+### warboy-vision CLI — 개별 모델 실행
+
+`warboy-vision` CLI로 개별 모델에 대해 직접 성능 평가를 수행할 수 있습니다.
+
+```bash
+# 단일 모델 성능 평가
+warboy-vision model-performance \
+    --config_file tutorials/cfg/yolov8n.yaml \
+    --batch-size 1
+
+# 다른 모델, 다른 배치 사이즈
+warboy-vision model-performance \
+    --config_file tutorials/cfg/yolov9t.yaml \
+    --batch-size 4
+```
+
+사용 가능한 config 파일 (`tutorials/cfg/`):
+- `yolov8n.yaml`, `yolov8l.yaml`
+- `yolov9t.yaml`, `yolov9c.yaml`, `yolov9s.yaml`
+
+### venv 비활성화
+
+작업이 끝나면 venv를 비활성화합니다.
+
+```bash
+deactivate
+```
+
+## 디렉토리 구조
+
+### furiosa만 선택 시
+
+```
+yolo-od-test/
+├── data/
+│   └── setup_yolo_od_test.sh
+├── dockerImage/
+│   └── furiosa/
+└── furiosa/
+    ├── warboy-vision-models/   ← git clone (이 저장소)
+    │   ├── tutorials/cfg/      ← 모델별 YAML 설정 파일
+    │   └── logs/               ← 실행 결과 로그
+    ├── venv/                   ← 신규 생성 (warboy-vision CLI 포함)
+    ├── models/
+    │   └── enf/                ← ENF 모델 파일 (.enf)
+    └── datasets/
+```
+
+### 모두 선택 시
+
+```
+yolo-od-test/
+├── data/
+│   └── setup_yolo_od_test.sh
+├── dockerImage/
+│   ├── furiosa/
+│   └── nvidia/
+├── furiosa/
+│   ├── warboy-vision-models/   ← git clone (이 저장소)
+│   ├── venv/                   ← 신규 생성
+│   ├── models/
+│   └── datasets/
+└── nvidia/
+    ├── yolov9/                 ← git clone
+    ├── venv/                   ← 신규 생성
+    ├── models/
+    └── datasets/
+```
+
+## 참고
+
+- `warboy-vision-models`는 Furiosa Warboy NPU 기반 비전 모델 저장소입니다
+- 재실행 시 이미 clone된 저장소는 `git pull`로 업데이트됩니다
+- venv는 매번 로컬에서 신규 생성되므로 서버 환경에 영향받지 않습니다
+- rsync는 변경된 파일만 전송하므로 재실행 시에도 효율적입니다
+- 소스 수정 후에는 반드시 `pip install .`을 다시 실행해야 변경 사항이 반영됩니다
+- ENF 파일은 `models/enf/`에 flat 구조로 저장됩니다 (하위 디렉토리 없음)
+
+---
+
+<details>
+<summary><b>Warboy-Vision-Models 원본 README (Original)</b></summary>
+
+## Warboy-Vision-Models
+
+The `warboy-vision-models` project is designed to assist users in running various deep learning vision models on [FuriosaAI](https://furiosa.ai/)'s first generation NPU (Neural Processing Unit), Warboy.
 Users can follow the outlined steps in the project to execute various vision applications, such as Object Detection, Pose Estimation, Instance Segmentation, etc., using Warboy.
 
 We hope that the resources here will help you utilize the FuriosaAI Warboy in your applications.
 
-# <div align="center">Model List</div>
+### Model List
 
-Currently, the project supports all vision applications provided by YOLO series ([YOLOv9](https://github.com/WongKinYiu/yolov9), [YOLOv8](https://github.com/ultralytics/ultralytics), [YOLOv7](https://github.com/WongKinYiu/yolov7) and [YOLOv5](https://github.com/ultralytics/yolov5)). If you want to explore all available models in the `warboy-vision-models` repository and detailed performance on Warboy, please refer to the following:
+Currently, the project supports all vision applications provided by YOLO series ([YOLOv9](https://github.com/WongKinYiu/yolov9), [YOLOv8](https://github.com/ultralytics/ultralytics), [YOLOv7](https://github.com/WongKinYiu/yolov7) and [YOLOv5](https://github.com/ultralytics/yolov5)).
 
-### Object Detection
-Object detection is a computer vision technique used to identify the presence of specific objects in images or videos and determine their locations. It entails classifying objects in videos or photos (classification) and precisely locating them using bounding boxes, thereby detecting objects through this process.
+### Installation
 
-<div align="center"><img width="1024" height="360" src="./data/images/object_detection.png"></div>
+This project requires Python 3.9 or above.
 
-<details><summary>Performance on Warboy</summary>
-
-<div align="center">
-
-| Model     | Input Size<br><sup>(pixels) | mAP<sup>val<br>50-95 (FP32) | mAP<sup>val<br>50-95 (INT8) | Warboy Speed<sup>Fusion<br>(ms) | Warboy Speed<sup>Single PE<br>(ms) |
-| --------- | --------------------------- | --------------------------- | --------------------------- | ------------------------------- | ---------------------------------- |
-| YOLOv9t   | 640x640                     | 38.3                        | 35.4                        | 2.13  (4.60)                    | 2.60  (4.94)                       |
-| YOLOv9s   | 640x640                     | 46.8                        | 43.4                        | 3.78  (6.40)                    | 5.36  (8.01)                       |
-| YOLOv9m   | 640x640                     | 51.4                        | 48.6                        | 9.21  (10.61)                   | 12.59 (14.28)                      |
-| YOLOv9c   | 640x640                     | 53.0                        | 49.5                        | 9.75  (11.12)                   | 14.86 (17.38)                      |
-| YOLOv9e   | 640x640                     | 55.6                        |                             |                                 |                                    |
-| YOLOv8n   | 640x640                     | 37.3                        | 34.7                        | 1.51  (4.10)                    | 1.89  (4.86)                       |
-| YOLOv8s   | 640x640                     | 44.9                        | 42.4                        | 2.97  (5.26)                    | 4.17  (10.67)                      |
-| YOLOv8m   | 640x640                     | 50.2                        | 47.6                        | 8.22  (10.03)                   | 11.67 (13.23)                      |
-| YOLOv8l   | 640x640                     | 52.9                        | 50.4                        | 15.22 (16.83)                   | 24.69 (26.41)                      |
-| YOLOv8x   | 640x640                     | 53.9                        | 51.4                        | 26.81 (28.41)                   |                                    |
-| YOLOv7    | 640x640                     | 51.4                        | 47.9                        | 8.76  (14.22)                   |                                    |
-| YOLOv7x   | 640x640                     | 53.1                        | 49.7                        | 15.61 (17.79)                   |                                    |
-| YOLOv5nu  | 640x640                     | 34.3                        | 31.8                        | 1.15  (3.83)                    | 1.34  (4.44)                       |
-| YOLOv5su  | 640x640                     | 43.0                        | 40.4                        | 2.14  (4.90)                    | 2.95  (9.59)                       |
-| YOLOv5mu  | 640x640                     | 49.0                        | 46.3                        | 4.77  (6.42)                    | 6.49  (8.08)                       |
-| YOLOv5lu  | 640x640                     | 52.2                        | 49.2                        | 8.89  (11.14)                   | 11.75 (14.35)                      |
-| YOLOv5xu  | 640x640                     | 53.2                        | 50.4                        | 16.51 (17.88)                   | 22.98 (24.39)                      |
-| YOLOv5n6u | 1280x1280                   | 42.1                        | 39.1                        | 2.67  (13.93)                   |                                    |
-| YOLOv5s6u | 1280x1280                   | 48.6                        | 45.5                        | 5.86  (15.55)                   |                                    |
-| YOLOv5m6u | 1280x1280                   | 53.6                        | 50.0                        | 13.76 (20.96)                   |                                    |
-| YOLOv5l6u | 1280x1280                   | 55.7                        | 51.8                        | 41.85 (47.08)                   |                                    |
-| YOLOv5x6u | 1280x1280                   | 56.8                        | 53.1                        |                                 |                                    |
-| YOLOv5n   | 640x640                     | 28.0                        | 26.0                        | 1.09  (8.00)                    | 1.26  (8.83)                       |
-| YOLOv5s   | 640x640                     | 37.4                        | 35.5                        | 1.93  (8.56)                    | 2.45  (8.92)                       |
-| YOLOv5m   | 640x640                     | 45.4                        | 43.0                        | 4.44  (12.39)                   | 5.88  (12.25)                      |
-| YOLOv5l   | 640x640                     | 49.0                        | 46.7                        | 7.70  (14.44)                   | 10.33 (16.15)                      |
-| YOLOv5x   | 640x640                     | 50.7                        | 48.7                        | 14.39 (19.66)                   | 20.49 (23.77)                      |
-| YOLOv5n6  | 1280x1280                   | 36.0                        | 33.3                        | 2.64  (28.29)                   | 3.51  (29.14)                      |
-| YOLOv5s6  | 1280x1280                   | 44.8                        | 41.9                        | 5.43  (33.10)                   |                                    |
-| YOLOv5m6  | 1280x1280                   | 51.3                        | 48.7                        | 12.73 (39.07)                   |                                    |
-| YOLOv5l6  | 1280x1280                   | 53.7                        | 50.9                        | 39.17 (63.08)                   |                                    |
-| YOLOv5x6  | 1280x1280                   | 55.0                        | 52.3                        |                                 |                                    |
-
-</div>
-</details>
-
-<p align="center">
-  <img src="./data/images/graph_fusion_det.png" width="48%"/>
-  <img src="./data/images/graph_single_det.png" width="48%"/>
-</p>
-
-### Pose Estimation
-Pose estimation is a technology that identifies and estimates the posture of a person or object by detecting body parts (typically joints) and using them to estimate the pose of the respective object.
-
-<div align="center"><img width="720" src="./data/images/pose_estimation.png"></div>
-
-<details><summary>Performance on Warboy</summary>
-
-<div align="center">
-  
-| Model        | Input Size<br><sup>(pixels) | mAP<sup>pose<br>50-95 (FP32) | mAP<sup>pose<br>50-95 (INT8) | Warboy Speed<sup>Fusion<br>(ms) | Warboy Speed<sup>Single PE<br>(ms) |
-| ------------ | --------------------------- | ---------------------------- | ---------------------------- | ------------------------------- | ---------------------------------- |
-| YOLOv8n-pose | 640x640                     | 50.4                         | 47.6                         | 1.54  (3.59)                    | 1.90  (4.06)                       |
-| YOLOv8s-pose | 640x640                     | 60.0                         | 56.7                         | 3.06  (4.76)                    | 4.14  (5.37)                       |
-| YOLOv8m-pose | 640x640                     | 65.0                         | 62.2                         | 8.36  (9.45)                    | 11.9  (13.05)                      |
-| YOLOv8l-pose | 640x640                     | 67.6                         | 65.0                         | 15.31 (16.43)                   | 24.89 (26.10)                      |
-| YOLOv8x-pose | 640x640                     | 69.2                         | 66.6                         | 27.55 (28.85)                   |                                    |
-</div>
-</details>
-
-<p align="center">
-  <img src="./data/images/graph_fusion_pose.png" width="48%"/>
-  <img src="./data/images/graph_single_pose.png" width="48%"/>
-</p>
-
-### Instance Segmentation 
-Instance segmentation is a technology that identifies multiple objects in an image or video and delineates the boundaries of each object. In essence, it combines Object Detection and Semantic Segmentation techniques to individually identify multiple objects belonging to the same class and estimate their boundaries.
-
-<div align="center"><img width="720" src="./data/images/instance_segmentation.png"></div>
-
-<details><summary>Performance on Warboy</summary>
-
-<div align="center">
-  
-| Model       | Input Size<br><sup>(pixels) | mAP<sup>box<br>50-95 (FP32) | mAP<sup>box<br>50-95 (INT8) | mAP<sup>mask<br>50-95 (FP32) | mAP<sup>mask<br>50-95 (INT8) | Warboy Speed<sup>Fusion<br>(ms) | Warboy Speed<sup>Single PE<br>(ms) |
-| ----------- | --------------------------- | --------------------------- | --------------------------- | ---------------------------- | ---------------------------- | ------------------------------- | ---------------------------------- |
-| YOLOv9c-seg | 640x640                     | 52.4                        | 49.5                        | 42.2                         | 39.3                         | 2.13  (4.60)                    | 2.60  (4.94)                       |
-| YOLOv9e-seg | 640x640                     | 55.1                        |                             | 44.3                         |                              | 3.78  (6.40)                    | 5.36  (8.01)                       |
-| YOLOv8n-seg | 640x640                     | 36.7                        | 33.9                        | 30.5                         | 27.8                         | 9.21  (10.61)                   | 12.59 (14.28)                      |
-| YOLOv8s-seg | 640x640                     | 44.6                        | 42.2                        | 36.8                         | 34.2                         | 9.75  (11.12)                   | 14.86 (17.38)                      |
-| YOLOv8m-seg | 640x640                     | 49.9                        | 47.3                        | 40.8                         | 38.2                         |                                 |
-| YOLOv8l-seg | 640x640                     | 52.3                        | 49.1                        | 42.6                         | 39.3                         |                                 |
-| YOLOv8x-seg | 640x640                     | 53.4                        | 50.4                        | 43.4                         | 40.1                         |                                 |
-</div>
-</details>
-
-<p align="center">
-  <img src="./data/images/graph_fusion_seg.png" width="48%"/>
-  <img src="./data/images/graph_single_seg.png" width="48%"/>
-</p>
-
-# <div align="center">Documentation</div>
-Please refer to the following for installation and usage examples. 
-
-## Installation
-To use this project, it's essential to install various software components provided by FuriosaAI. For detailed instructions on installing packages, drivers, and the Furiosa SDK, please see the following:
-
-- **Driver, Firmware and Runtime Installation** ([English](https://furiosa-ai.github.io/docs/latest/en/software/installation.html) | [한국어](https://furiosa-ai.github.io/docs/latest/ko/software/installation.html))
-
-
-This project requires Python 3.9 or above. You can install the required Python packages using pip as follows,
 ```sh
 pip install -r requirements.txt
-```
-and install required packages for post processing utilities using apt. Then, build C++ post processing utilities.
-```sh
 sudo apt-get update
 sudo apt-get install cmake libeigen3-dev
 ./build.sh
-```
-Before installing the project, please make sure to check `CHECK` flags and set them to your own paths if you are using your own dataset. If you downloaded the coco2017 dataset with `coco2017.sh`, you can skip this step. So for convenience, please use the `coco2017.sh` script to download the dataset.
-
-After verifying the settings, install the project using pip. 
-```sh
 pip install .
 ```
-After installation, you can use the `warboy-vision` command-line interface (CLI).
-You can view all available CLI commands by running:
+
+After installation, you can use the `warboy-vision` CLI:
 ```sh
 warboy-vision --help
-```
-For detailed usage information about a specific command, use:
-```sh
 warboy-vision <command> --help
 ```
 
-## Testing
+### Usage Example
 
-<details open>
-<summary> Performance test with pytest </summary>
-
-The project provides pytest for performance testing. You can test the performance of object detection, pose estimation, and instance segmentation applications. You can also test NPU performance. You can check supported models in tests/test_config. Before running the tests, please prepare quantized ONNX model files and COCO datasets, then update the paths in `tests/test_config` and `tests/e2e` accordingly.
-
-- **pytest command**
+- **Model making**
   ```sh
-  pytest
+  warboy-vision make-model --config_file "/path/to/your/model/cfg.yaml"
+  warboy-vision export-onnx --config_file "/path/to/your/model/cfg.yaml"
+  warboy-vision quantize --config_file "/path/to/your/model/cfg.yaml"
   ```
-</details>
 
-
-## Usage Example
-
-<details open>
-<summary> Set configuration files for the project </summary>
-
-Before running the project, you need to set up configuration files for model and demo. 
-
-- **Model config file** : it contains parameters about the model and quantization. 
-```yaml
-application: object_detection                                                   # vision task (object detection | pose estimation | instance segmentation)
-model_name: yolov8n                                                             # model name
-weight: ./models/weight/object_detection/yolov8n.pt                             # weight file path
-onnx_path: ./models/onnx/object_detection/yolov8n.onnx                          # onnx model path
-onnx_i8_path: ./models/quantized_onnx/object_detection/yolov8n_i8.onnx          # quantized onnx model path
-
-calibration_params:
-  calibration_method: SQNR_ASYM                     # calibration method
-  calibration_data: ./datasets/coco/val2017         # calibration data path
-  num_calibration_data: 10                          # number of calibration data
-
-confidence_threshold: 0.25
-iou_threshold: 0.7
-input_shape: [1, 3, 640, 640]         # model input shape (Height, Width)
-anchors:                              # anchor information
-  - 
-class_names:                          # class names
-  - ...
-```
-
-- **Demo config file** : it contains device information and video paths for the project.
-
-```yaml
-application: object_detection
-model_config: ./warboy/cfg/model_config/object_detection/yolov8n.yaml     # model config file path
-model_path: ./models/quantized_onnx/object_detection/yolov8n_i8.onnx      # quantized onnx model path
-num_workers: 8                                                                                      
-device: warboy(2)*1                                                       # device name (warboy(2)*1 | warboy(1)*1 | npu0pe0 | etc.)
-video_path: 
-  - [set your demo video file path]
-```
-</details>
-
-</details>
-
-<details open>
-<summary> Export ONNX & Quantizing an ONNX model using Furiosa SDK </summary>
-Next, it is necessary to export the model to the ONNX format. 
-
-If you already have the model in ONNX format, the next step is the model quantization process. Since FuriosaAI's Warboy only supports models in 8-bit integer format (int8), it is necessary to quantize the float32-based model into an int8 data type model. 
-
-- **model making commands**
+- **Demo**
   ```sh
-  warboy-vision make-model --config_file "/path/to/your/model/cfg.yaml"       # from onnx export to quantize
-
-  # if you want to export onnx model
-  warboy-vision export-onnx --config_file "/path/to/your/model/cfg.yaml"      # export onnx
-
-  # if you want to quantize onnx model
-  warboy-vision quantize --config_file "/path/to/your/model/cfg.yaml"         # quantize
+  warboy-vision run-demo --demo_config_file "/path/to/your/demo/cfg.yaml" --mode web
+  warboy-vision run-demo --demo_config_file "/path/to/your/demo/cfg.yaml" --mode file
   ```
-</details>
 
-<details open>
-<summary> Running the project using Furiosa Runtime </summary>
-In the project, vision applications are executed for videos from multiple channels. To accomplish this effectively, optimization tasks such as Python parallel programming, asynchronous processing, and post-processing using C++ have been included. For a detailed understanding of the project structure, please refer to the following image:
-
-
-<div align="center"><img width="960" src="./data/images/structure.png"></div>
-  
-- **demo commands**
-  
+- **Performance test**
   ```sh
-  warboy-vision run-demo --demo_config_file "/path/to/your/demo/cfg.yaml" --mode web   # see the result on a webpage using FastAPI (http://0.0.0.0:20001 or http://localhost:20001)
-
-  warboy-vision run-demo --demo_config_file "/path/to/your/demo/cfg.yaml" --mode file  # outputs will be saved in outputs/ folder
+  warboy-vision model-performance --config_file "/path/to/your/model/cfg.yaml"
+  warboy-vision npu-performance --config_file "/path/to/your/model/cfg.yaml"
   ```
-</details>
 
-<details open>
-<summary> End-to-end performance test </summary>
-In the project, there are end-to-end performance tests for various vision applications. We can test the performance of object detection, pose estimation, and instance segmentation applications. Also, we can test NPU performance, too.
-
-*"OpenTelemetry trace error occurred. cannot send span to the batch span processor because the channel is full"* error can occur when running the NPU performance test, but it does not affect the performance test. You can ignore this error.
-
-- **performance test commands**
-  
-  ```sh
-  warboy-vision model-performance --config_file "/path/to/your/model/cfg.yaml"    # performance test for model with config file
-
-  warboy-vision npu-performance --config_file "/path/to/your/model/cfg.yaml"      # NPU performance test for model with config file
-  ```
+For detailed information, please refer to the [FuriosaAI documentation](https://furiosa-ai.github.io/docs/latest/en/software/installation.html).
 
 </details>
